@@ -228,32 +228,37 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         pretty = f"{a1}, {y}"
         out.append(InTextCitation("author-year", m.group(0), key, pretty, a1, y))
 
-    # Parenthetical blocks: (Kofi, 2000; Mensah, 2001)
-    paren_block = re.compile(rf"\(([^()]*?\b{YEAR}\b[^()]*)\)")
-    for m in paren_block.finditer(text):
-        block = m.group(1)
-        parts = [p.strip() for p in block.split(";")]
-        for p in parts:
-            # Organisation in parentheses: (UNCTAD, 2025) or (World Bank, 2023)
-            org_seg = re.search(rf"^(.+?)\s*,\s*({YEAR})\b", p)
-            if org_seg:
-                cand, y = org_seg.group(1).strip(), org_seg.group(2)
-                if is_known_org(cand):
-                    key = key_org_year(cand, y)
-                    pretty = f"{cand}, {y}"
-                    out.append(InTextCitation("org-year", f"({p})", key, pretty, cand, y))
-                    continue
+ # Replace the per-part parsing inside the parenthetical block with this:
 
-            # Author in parentheses: (Kofi, 2000) or (Kofi et al., 2000)
-            au = re.search(
-                rf"([A-Z][A-Za-z\-']+)(?:\s*(?:and|&)\s*([A-Z][A-Za-z\-']+)|\s+et\s+al\.)?\s*,\s*({YEAR})",
-                p,
-            )
-            if au:
-                a1, y = au.group(1), au.group(3)
-                key = key_author_year(a1, y)
-                pretty = f"{a1}, {y}"
-                out.append(InTextCitation("author-year", f"({p})", key, pretty, a1, y))
+# Parenthetical blocks: (Kofi, 2000; Mensah, 2001) or (Al-Majali, Alsarayreh & Alqaralleh, 2025)
+paren_block = re.compile(rf"\(([^()]*?\b{YEAR}\b[^()]*)\)")
+for m in paren_block.finditer(text):
+    block = m.group(1)
+    parts = [p.strip() for p in block.split(";")]
+    for p in parts:
+        # If there are multiple authors before ONE year, treat the FIRST author as the key
+        # Example: "Al-Majali, Alsarayreh & Alqaralleh, 2025"
+        m_multi = re.search(rf"^([A-Z][A-Za-z\-']+)\s*,.*?\b({YEAR})\b", p)
+        if m_multi:
+            first_author = m_multi.group(1)
+            y = m_multi.group(2)
+            key = key_author_year(first_author, y)
+            pretty = f"{first_author}, {y}"
+            out.append(InTextCitation(style="author-year", raw=f"({p})", key=key, pretty=pretty,
+                                      author_or_org=first_author, year=y))
+            continue
+
+        # Organisation inside parentheses: (UNCTAD, 2025)
+        org_seg = re.search(rf"^(.+?)\s*,\s*({YEAR})\b", p)
+        if org_seg:
+            cand, y = org_seg.group(1).strip(), org_seg.group(2)
+            if is_known_org(cand):
+                key = key_org_year(cand, y)
+                pretty = f"{cand}, {y}"
+                out.append(InTextCitation(style="org-year", raw=f"({p})", key=key, pretty=pretty,
+                                          author_or_org=cand, year=y))
+                continue
+
 
     # Organisation narrative: UNCTAD (2025), WHO (2020), World Bank (2023)
     org_narr = re.compile(rf"\b([A-Z][A-Za-z&.\- ]{{2,}}?)\s*\(\s*({YEAR})\s*\)")
@@ -874,4 +879,5 @@ with st.expander("Extracted items (debug)"):
         st.dataframe(pd.DataFrame([c.__dict__ for c in cites]), use_container_width=True)
     with tab2:
         st.dataframe(pd.DataFrame([r.__dict__ for r in refs]), use_container_width=True)
+
 
