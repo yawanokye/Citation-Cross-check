@@ -35,12 +35,13 @@ CROSSREF_API = "https://api.crossref.org/works"
 OPENALEX_API = "https://api.openalex.org/works"
 
 REF_HEADINGS = [
-    r"^\s*references\s*$",
-    r"^\s*reference\s*$",
-    r"^\s*bibliography\s*$",
-    r"^\s*works\s+cited\s*$",
-    r"^\s*literature\s+cited\s*$",
+    r"^\s*references?\s*[:|]?\s*$",
+    r"^\s*bibliograph(y|ies)\s*[:|]?\s*$",
+    r"^\s*works\s+cited\s*[:|]?\s*$",
+    r"^\s*literature\s+cited\s*[:|]?\s*$",
+    r"^\s*reference\s+list\s*[:|]?\s*$",
 ]
+
 
 # Known organisation aliases (expand as needed)
 ORG_ALIASES = {
@@ -183,7 +184,7 @@ def split_by_heading(text: str) -> Tuple[str, str, str]:
     lines = text.splitlines()
     for i, line in enumerate(lines):
         for pat in REF_HEADINGS:
-            if re.match(pat, line.strip(), flags=re.IGNORECASE):
+            if re.search(pat, line.strip(), flags=re.IGNORECASE):
                 main = "\n".join(lines[:i]).strip()
                 refs = "\n".join(lines[i+1:]).strip()
                 return main, refs, f"Found heading: {line.strip()}"
@@ -947,3 +948,4 @@ with st.expander("Extracted items (debug)"):
         st.dataframe(pd.DataFrame([c.__dict__ for c in cites]), use_container_width=True)
     with tab2:
         st.dataframe(pd.DataFrame([r.__dict__ for r in refs]), use_container_width=True)
+
