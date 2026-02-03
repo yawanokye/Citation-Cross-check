@@ -1,7 +1,7 @@
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Iterable
 from collections import Counter, defaultdict
 from io import BytesIO
 
@@ -27,21 +27,20 @@ except Exception:
     pdfplumber = None
 
 
-# -----------------------------
+# =============================
 # Constants
-# -----------------------------
-YEAR = r"(?:19|20)\d{2}[a-z]?"
+# =============================
+YEAR = r"(?:19|20)\d{2}[a-z]?"  # allows 2020a
 CROSSREF_API = "https://api.crossref.org/works"
 OPENALEX_API = "https://api.openalex.org/works"
 
+# Heading detection that matches: Reference |, REFERENCES:, Reference List, etc.
 REF_HEADINGS = [
-    r"^\s*references?\s*[:|]?\s*$",
-    r"^\s*bibliograph(y|ies)\s*[:|]?\s*$",
+    r"^\s*references?\s*(?:list)?\s*[:|]?\s*$",
+    r"^\s*bibliograph(?:y|ies)\s*[:|]?\s*$",
     r"^\s*works\s+cited\s*[:|]?\s*$",
     r"^\s*literature\s+cited\s*[:|]?\s*$",
-    r"^\s*reference\s+list\s*[:|]?\s*$",
 ]
-
 
 # Known organisation aliases (expand as needed)
 ORG_ALIASES = {
@@ -49,25 +48,29 @@ ORG_ALIASES = {
     "who": ["who", "world health organization", "world health organisation"],
     "oecd": ["oecd", "organisation for economic co-operation and development",
              "organization for economic cooperation and development"],
-    "world bank": ["world bank", "international bank for reconstruction and development", "ibrd", "world bank group"],
+    "world bank": ["world bank", "international bank for reconstruction and development", "ibrd"],
+    "world bank group": ["world bank group"],
     "imf": ["imf", "international monetary fund"],
     "un": ["un", "united nations"],
     "unesco": ["unesco"],
     "unicef": ["unicef"],
 }
 
-ORG_ACRONYMS = {k.upper() for k in ["UNCTAD", "WHO", "OECD", "WORLD BANK", "WORLD BANK GROUP", "IMF", "UN", "UNESCO", "UNICEF"]}
+ORG_ACRONYMS = {
+    "UNCTAD", "WHO", "OECD", "IMF", "UN", "UNESCO", "UNICEF",
+    "WORLD BANK", "WORLD BANK GROUP", "IBRD"
+}
 
 
-# -----------------------------
+# =============================
 # Data classes
-# -----------------------------
+# =============================
 @dataclass
 class InTextCitation:
     style: str                  # author-year | org-year | numeric
     raw: str
     key: str                    # internal key (stable)
-    pretty: str                 # user-friendly display (e.g., "Kofi, 2000")
+    pretty: str                 # display e.g., "Kofi, 2000"
     author_or_org: Optional[str] = None
     year: Optional[str] = None
     number: Optional[int] = None
@@ -83,9 +86,9 @@ class ReferenceEntry:
     number: Optional[int] = None
 
 
-# -----------------------------
+# =============================
 # Normalisation
-# -----------------------------
+# =============================
 def norm_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
@@ -95,20 +98,13 @@ def norm_token(s: str) -> str:
     return norm_spaces(s)
 
 def titleish(s: str) -> str:
-    # Keep "World Bank" style, keep acronyms as-is
     if not s:
         return s
-    if s.upper() in ORG_ACRONYMS:
-        return s.upper()
-    # Title-case words, but keep small words tidy
-    words = s.split()
-    out = []
-    for w in words:
-        if w.isupper():
-            out.append(w)
-        else:
-            out.append(w[:1].upper() + w[1:])
-    return " ".join(out)
+    if s.strip().upper() in ORG_ACRONYMS:
+        return s.strip().upper()
+    # Keep "World Bank" casing good
+    words = s.strip().split()
+    return " ".join(w[:1].upper() + w[1:] if w else w for w in words)
 
 def canon_org(name: str) -> str:
     n = norm_token(name)
@@ -135,36 +131,46 @@ def is_known_org(text: str) -> bool:
     return c in ORG_ALIASES.keys()
 
 def looks_like_two_authors(name: str) -> bool:
-    # Stops false org classification like "Saslavsky Shepherd"
+    # e.g., "Saslavsky Shepherd" should not be treated as org
     parts = name.strip().split()
-    if len(parts) == 2 and all(p[:1].isupper() for p in parts):
-        return True
-    return False
+    return len(parts) == 2 and all(p[:1].isupper() for p in parts)
 
 
-# -----------------------------
-# File readers
-# -----------------------------
+# =============================
+# DOCX block iterator (keeps order of paragraphs and tables)
+# =============================
+def iter_block_items(document) -> Iterable[Tuple[str, str]]:
+    """
+    Yields ("p", paragraph_text) or ("t", table_row_text) in document order.
+    This avoids the common bug where references are in tables and ordering breaks.
+    """
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    parent = document.element.body
+    for child in parent.iterchildren():
+        if isinstance(child, CT_P):
+            p = Paragraph(child, document)
+            t = p.text.strip()
+            if t:
+                yield ("p", t)
+        elif isinstance(child, CT_Tbl):
+            tbl = Table(child, document)
+            for row in tbl.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    yield ("t", " ".join(cells))
+
+
 def read_docx(file) -> str:
     if docx is None:
         raise RuntimeError("python-docx not installed")
-
     d = docx.Document(file)
-    parts: List[str] = []
-
-    # Paragraphs
-    for p in d.paragraphs:
-        t = p.text.strip()
-        if t:
-            parts.append(t)
-
-    # Tables (very common for reference lists copied from PDFs)
-    for table in d.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-            if cells:
-                parts.append(" ".join(cells))
-
+    parts = []
+    for _, txt in iter_block_items(d):
+        parts.append(txt)
     return "\n".join(parts)
 
 def read_pdf(file) -> str:
@@ -177,17 +183,18 @@ def read_pdf(file) -> str:
     return "\n".join(out)
 
 
-# -----------------------------
+# =============================
 # Reference section detection
-# -----------------------------
+# =============================
 def split_by_heading(text: str) -> Tuple[str, str, str]:
     lines = text.splitlines()
     for i, line in enumerate(lines):
+        s = line.strip()
         for pat in REF_HEADINGS:
-            if re.search(pat, line.strip(), flags=re.IGNORECASE):
+            if re.search(pat, s, flags=re.IGNORECASE):
                 main = "\n".join(lines[:i]).strip()
                 refs = "\n".join(lines[i+1:]).strip()
-                return main, refs, f"Found heading: {line.strip()}"
+                return main, refs, f"Found heading: {s}"
     return text.strip(), "", "No heading found"
 
 def ref_line_score(line: str) -> int:
@@ -195,60 +202,106 @@ def ref_line_score(line: str) -> int:
     if not s:
         return 0
 
-    # numbered styles: 1. ... or 1) ... or [1] ...
+    # Numbered references: 1. ... or 1) ... or [1] ...
     if re.match(r"^\s*(\[\d+\]|\d+[\.\)])\s+", s):
-        return 4
+        return 5
 
     # Author-year ref: Surname, X. (2020). ...
     if re.match(rf"^[A-Z][A-Za-z\-']+\s*,.*\(\s*{YEAR}\s*\)", s):
-        return 5
+        return 6
 
     # Harvard-ish: Surname, X. ... 2020 ...
     if re.match(rf"^[A-Z][A-Za-z\-']+\s*,.*\b{YEAR}\b", s):
-        return 3
+        return 4
 
     # Org: UNCTAD. (2025). ...
     if re.match(rf"^[A-Z][A-Z&\- ]{{2,}}\.\s*\(\s*{YEAR}\s*\)", s):
-        return 5
+        return 6
 
-    # Org: World Bank (2023) ...
+    # Many reference lists start with Title Case org like "World Bank (2023)"
     if re.match(rf"^[A-Z][A-Za-z&.\- ]{{2,}}?\s*\(\s*{YEAR}\s*\)", s):
-        return 2
+        return 3
 
     return 0
 
-def auto_detect_references_start(text: str) -> int:
+def auto_detect_references_start(text: str) -> Tuple[int, float]:
+    """
+    Returns (best_line_index, confidence_score 0..1).
+    Confidence is based on how strong the window scoring peak is.
+    """
     lines = text.splitlines()
     if len(lines) < 40:
-        return max(0, int(len(lines) * 0.65))
+        idx = max(0, int(len(lines) * 0.70))
+        return idx, 0.2
 
-    window = 35
-    best_i = int(len(lines) * 0.70)
-    best_score = -1
-
-    start = int(len(lines) * 0.40)
+    window = 40
+    start = int(len(lines) * 0.35)
+    scores = []
     for i in range(start, max(start + 1, len(lines) - window)):
         score = sum(ref_line_score(lines[j]) for j in range(i, i + window))
-        # prefer later if score ties
-        if score > best_score or (score == best_score and i > best_i):
-            best_score = score
-            best_i = i
-    return best_i
+        scores.append((i, score))
+
+    if not scores:
+        idx = max(0, int(len(lines) * 0.70))
+        return idx, 0.2
+
+    scores_sorted = sorted(scores, key=lambda x: x[1], reverse=True)
+    best_i, best_s = scores_sorted[0]
+    second_s = scores_sorted[1][1] if len(scores_sorted) > 1 else 0
+
+    # Normalize confidence: best_s must be meaningfully above baseline
+    conf = 0.0
+    if best_s <= 0:
+        conf = 0.0
+    else:
+        # If best is much larger than second best, confidence rises
+        margin = best_s - second_s
+        conf = max(0.0, min(1.0, (best_s / (best_s + 25)) + (margin / (best_s + 1)) * 0.35))
+
+    return best_i, conf
 
 
-# -----------------------------
+# =============================
 # In-text citation extraction (APA/Harvard)
-# -----------------------------
+# =============================
+def _first_surname_from_author_blob(blob: str) -> Optional[str]:
+    """
+    blob examples:
+      "Mensah" / "Mensah & Boateng" / "Mensah and Boateng" / "Mensah et al."
+      "Al-Majali, Alsarayreh & Alqaralleh" (common inside parentheses)
+    Returns first surname token.
+    """
+    if not blob:
+        return None
+    b = blob.strip()
+
+    # Remove leading "see" / "e.g." / "cf."
+    b = re.sub(r"^(see|e\.g\.|cf\.)\s+", "", b, flags=re.IGNORECASE)
+
+    # Split by comma first (handles "Al-Majali, Alsarayreh & Alqaralleh")
+    first = b.split(",")[0].strip()
+
+    # Split by & / and
+    first = re.split(r"\s+(?:and|&)\s+", first, flags=re.IGNORECASE)[0].strip()
+
+    # Remove et al.
+    first = re.sub(r"\s+et\s+al\.?$", "", first, flags=re.IGNORECASE).strip()
+
+    # Keep only surname-like token (allow hyphen and apostrophe)
+    m = re.search(r"([A-Z][A-Za-z\-']+)", first)
+    return m.group(1) if m else None
+
+
 def extract_author_year_citations(text: str) -> List[InTextCitation]:
     out: List[InTextCitation] = []
 
-    # Narrative: Kofi (2000), Kofi & Mensah (2000), Kofi et al. (2000)
+    # Narrative: Author (2000), Author & Author (2000), Author et al. (2000)
     narr = re.compile(
         rf"\b([A-Z][A-Za-z\-']+)(?:\s+(?:and|&)\s+([A-Z][A-Za-z\-']+)|\s+et\s+al\.)?\s*\(\s*({YEAR})\s*\)"
     )
     for m in narr.finditer(text):
-        a1, y = m.group(1), m.group(3)
-        # If the "author" is actually a known org (rare but possible), treat as org
+        a1 = m.group(1)
+        y = m.group(3)
         if is_known_org(a1):
             key = key_org_year(a1, y)
             pretty = f"{titleish(a1)}, {y}"
@@ -258,40 +311,49 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             pretty = f"{titleish(a1)}, {y}"
             out.append(InTextCitation("author-year", m.group(0), key, pretty, a1, y))
 
-    # Parenthetical blocks: (Kofi, 2000; Mensah, 2001) or (UNCTAD, 2025)
+    # Parenthetical blocks:
+    # (Kofi, 2000; Mensah & Boateng, 2001; UNCTAD, 2025)
     paren_block = re.compile(rf"\(([^()]*?\b{YEAR}\b[^()]*)\)")
     for m in paren_block.finditer(text):
         block = m.group(1)
-        parts = [p.strip() for p in block.split(";")]
+        parts = [p.strip() for p in block.split(";") if p.strip()]
 
         for p in parts:
-            # Organisation inside parentheses: UNCTAD, 2025  | World Bank, 2023
-            org_seg = re.search(rf"^(.+?)\s*,\s*({YEAR})\b", p)
-            if org_seg:
-                cand, y = org_seg.group(1).strip(), org_seg.group(2)
-                # If it's a known org, force org key (this fixes UNCTAD becoming au_unctad_2025)
-                if is_known_org(cand) and not looks_like_two_authors(cand):
-                    key = key_org_year(cand, y)
-                    pretty = f"{titleish(cand)}, {y}"
-                    out.append(InTextCitation("org-year", f"({p})", key, pretty, cand, y))
-                    continue
+            # Match "... , 2020" near the end
+            yrm = re.search(rf"\b({YEAR})\b", p)
+            if not yrm:
+                continue
+            y = yrm.group(1)
 
-            # Multiple authors before ONE year: "Al-Majali, Alsarayreh & Alqaralleh, 2025"
-            m_multi = re.search(rf"^([A-Z][A-Za-z\-']+)\s*,.*?\b({YEAR})\b", p)
-            if m_multi:
-                first_author, y = m_multi.group(1), m_multi.group(2)
-                # Don't misclassify a known org as author here either
-                if is_known_org(first_author):
-                    key = key_org_year(first_author, y)
-                    pretty = f"{titleish(first_author)}, {y}"
-                    out.append(InTextCitation("org-year", f"({p})", key, pretty, first_author, y))
-                else:
-                    key = key_author_year(first_author, y)
-                    pretty = f"{titleish(first_author)}, {y}"
-                    out.append(InTextCitation("author-year", f"({p})", key, pretty, first_author, y))
+            # Candidate author/org part = everything before year (common: "Name, 2020")
+            # If "..., 2020" take left side, else fallback to first surname
+            left = p
+            m_left = re.search(rf"^(.+?)\s*,\s*{YEAR}\b", p)
+            if m_left:
+                left = m_left.group(1).strip()
+
+            # Organisation forced only if known
+            if is_known_org(left) and not looks_like_two_authors(left):
+                key = key_org_year(left, y)
+                pretty = f"{titleish(left)}, {y}"
+                out.append(InTextCitation("org-year", f"({p})", key, pretty, left, y))
                 continue
 
-    # Organisation narrative: UNCTAD (2025), WHO (2020), World Bank (2023)
+            first_author = _first_surname_from_author_blob(left) or _first_surname_from_author_blob(p)
+            if not first_author:
+                continue
+
+            # If author token is actually known org acronym, treat as org
+            if is_known_org(first_author):
+                key = key_org_year(first_author, y)
+                pretty = f"{titleish(first_author)}, {y}"
+                out.append(InTextCitation("org-year", f"({p})", key, pretty, first_author, y))
+            else:
+                key = key_author_year(first_author, y)
+                pretty = f"{titleish(first_author)}, {y}"
+                out.append(InTextCitation("author-year", f"({p})", key, pretty, first_author, y))
+
+    # Organisation narrative: World Bank (2023), UNCTAD (2025)
     org_narr = re.compile(rf"\b([A-Z][A-Za-z&.\- ]{{2,}}?)\s*\(\s*({YEAR})\s*\)")
     for m in org_narr.finditer(text):
         org, y = m.group(1).strip(), m.group(2)
@@ -305,9 +367,9 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
     return out
 
 
-# -----------------------------
+# =============================
 # Numeric citation extraction
-# -----------------------------
+# =============================
 def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
     out = []
     pat = re.compile(r"\[(\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\]")
@@ -356,50 +418,55 @@ def extract_vancouver_parentheses_numeric(text: str) -> List[InTextCitation]:
     return out
 
 
-# -----------------------------
+# =============================
 # Reference entry extraction
-# -----------------------------
+# =============================
 def split_reference_entries(ref_text: str) -> List[str]:
     ref_text = ref_text.strip()
     if not ref_text:
         return []
 
-    # First try blank-line chunks
-    chunks = [c.strip() for c in re.split(r"\n\s*\n", ref_text) if c.strip()]
-    if len(chunks) >= 5:
-        return chunks
-
-    # Otherwise, line-join until a new entry start is detected
+    # Strongly handle numbered lists like:
+    # 1. Author, ... (2020). ...
+    # 2. ...
     lines = [l.rstrip() for l in ref_text.splitlines() if l.strip()]
     entries = []
     buf = ""
 
     start_pat = re.compile(
-        r"^(\[?\d+\]?[\.\)]\s+)"           # 1. / 1) / [1]
-        r"|^([A-Z][A-Za-z\-']+\s*,)"       # Surname,
-        r"|^([A-Z][A-Z&\- ]{2,}\.)"        # ORG.
-        r"|^(World Bank|World Bank Group|UNCTAD|OECD|WHO|IMF|UNESCO|UNICEF)\b",  # common org starters
+        r"^\s*(\[\d+\]|\d+[\.\)])\s+"          # numbered start
+        r"|^\s*[A-Z][A-Za-z\-']+\s*,"          # surname,
+        r"|^\s*[A-Z][A-Z&\- ]{2,}\."           # ORG.
+        r"|^\s*(World Bank|World Bank Group|UNCTAD|OECD|WHO|IMF|UNESCO|UNICEF)\b",
         flags=re.IGNORECASE
     )
 
     for line in lines:
         if start_pat.search(line) and buf:
             entries.append(buf.strip())
-            buf = line
+            buf = line.strip()
         else:
-            buf = (buf + " " + line).strip() if buf else line
+            buf = (buf + " " + line.strip()).strip() if buf else line.strip()
 
     if buf:
         entries.append(buf.strip())
+
+    # If the whole thing still ended up as 1 chunk, try splitting at numbered tokens within the chunk
+    if len(entries) == 1:
+        big = entries[0]
+        chunks = re.split(r"(?=(?:\s|^)(?:\[\d+\]|\d+[\.\)])\s+)", big)
+        chunks = [norm_spaces(c) for c in chunks if norm_spaces(c)]
+        if len(chunks) >= 2:
+            entries = chunks
+
     return entries
 
-def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
-    e = entry.strip()
-    if not e:
-        return None
+def _strip_leading_numbering(entry: str) -> str:
+    return re.sub(r"^\s*(\[\d+\]|\d+[\.\)])\s+", "", entry).strip()
 
-    # Numeric ref mistakenly in APA mode, ignore here
-    if re.match(r"^\s*(\[\d+\]|\d+[\.\)])\s+", e):
+def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
+    e = _strip_leading_numbering(entry)
+    if not e:
         return None
 
     # Organisation: UNCTAD. (2025). ...
@@ -411,7 +478,7 @@ def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
             pretty = f"{titleish(org)}, {y}"
             return ReferenceEntry(entry, key, pretty, org, y)
 
-    # Organisation: World Bank (2023). ... OR World Bank. (2023). ...
+    # Organisation: World Bank (2023). ... or World Bank. (2023). ...
     org2 = re.search(rf"^([A-Z][A-Za-z&.\- ]{{2,}}?)\.?\s*\(\s*({YEAR})\s*\)", e)
     if org2:
         org, y = org2.group(1).strip(), org2.group(2)
@@ -453,9 +520,9 @@ def parse_reference_numeric(entry: str) -> Optional[ReferenceEntry]:
     return None
 
 
-# -----------------------------
+# =============================
 # Year mismatch check (author-year + org-year)
-# -----------------------------
+# =============================
 def base_key(k: str) -> str:
     parts = k.split("_")
     return "_".join(parts[:-1]) if len(parts) >= 3 else k
@@ -489,17 +556,17 @@ def find_year_mismatches(cite_keys: List[str], ref_keys: List[str]) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-# -----------------------------
+# =============================
 # Online verification (Crossref + OpenAlex)
-# -----------------------------
+# =============================
 def build_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "citation-crosscheck/1.1"})
+    s.headers.update({"User-Agent": "citation-crosscheck/1.2"})
     return s
 
 SESSION = build_session()
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=6))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=7))
 def _get_json(url: str, params: dict) -> dict:
     r = SESSION.get(url, params=params, timeout=25)
     r.raise_for_status()
@@ -532,18 +599,19 @@ def guess_year(ref: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def guess_surname_or_org(ref: str) -> Optional[str]:
-    m = re.match(r"^\s*([A-Z][A-Za-z\-']+)\s*,", ref)
+    r = _strip_leading_numbering(ref)
+    m = re.match(r"^\s*([A-Z][A-Za-z\-']+)\s*,", r)
     if m:
         return m.group(1)
-    # org starter like "World Bank" or "UNCTAD"
-    m2 = re.match(r"^\s*([A-Z][A-Za-z&.\- ]{2,})\s*(?:\(|\.)", ref)
+    m2 = re.match(r"^\s*([A-Z][A-Za-z&.\- ]{2,})\s*(?:\(|\.)", r)
     if m2:
         return m2.group(1).strip()
     return None
 
 def guess_title_snippet(ref: str) -> str:
-    t = re.sub(rf"\(.*?{YEAR}.*?\)", " ", ref)
-    t = re.sub(r"^[^\.]{1,140}\.\s*", " ", t)
+    r = _strip_leading_numbering(ref)
+    t = re.sub(rf"\(.*?{YEAR}.*?\)", " ", r)
+    t = re.sub(r"^[^\.]{1,160}\.\s*", " ", t)
     t = norm_spaces(t)
     words = t.split()
     return " ".join(words[:14])[:180]
@@ -562,7 +630,7 @@ def verify_reference_online(ref_entry: str, throttle_s: float = 0.2,
 
     query = " ".join([p for p in [who, y, title_snip] if p]).strip()
     if not query:
-        query = ref_entry[:200]
+        query = _strip_leading_numbering(ref_entry)[:200]
 
     time.sleep(max(0.0, throttle_s))
 
@@ -591,7 +659,7 @@ def verify_reference_online(ref_entry: str, throttle_s: float = 0.2,
                         "query_used": query[:220],
                     }
         except Exception as e:
-            best["error_crossref"] = str(e)[:200]
+            best["error_crossref"] = str(e)[:220]
 
     if use_openalex:
         try:
@@ -622,17 +690,14 @@ def verify_reference_online(ref_entry: str, throttle_s: float = 0.2,
                         "query_used": query[:220],
                     }
         except Exception as e:
-            best["error_openalex"] = str(e)[:200]
-
-    if best["status"] == "not_found":
-        best["score"] = 0
+            best["error_openalex"] = str(e)[:220]
 
     return best
 
 
-# -----------------------------
+# =============================
 # PDF report
-# -----------------------------
+# =============================
 def make_pdf_report(style_name: str,
                     summary: dict,
                     df_missing: pd.DataFrame,
@@ -664,7 +729,7 @@ def make_pdf_report(style_name: str,
             c.showPage()
             y = height - 2 * cm
 
-    def draw_table(title: str, df: pd.DataFrame, max_rows: int = 28):
+    def draw_table(title: str, df: pd.DataFrame, max_rows: int = 30):
         nonlocal y
         c.showPage()
         y = height - 2 * cm
@@ -684,7 +749,7 @@ def make_pdf_report(style_name: str,
         y -= 0.3 * cm
 
         for _, row in df.head(max_rows).iterrows():
-            line = " | ".join(str(row[col])[:70] for col in cols)
+            line = " | ".join(str(row[col])[:72] for col in cols)
             c.drawString(2 * cm, y, line)
             y -= 0.45 * cm
             if y < 2 * cm:
@@ -705,9 +770,9 @@ def make_pdf_report(style_name: str,
     return buf.getvalue()
 
 
-# -----------------------------
+# =============================
 # Streamlit UI
-# -----------------------------
+# =============================
 st.set_page_config(page_title="Citation Crosschecker", layout="wide")
 st.title("Citation Crosschecker")
 
@@ -741,29 +806,40 @@ if not text.strip():
     st.info("Upload a file or paste text to begin.")
     st.stop()
 
+# Split by heading first
 main_text, ref_text, ref_msg = split_by_heading(text)
+
+# If heading missing, compute auto-detect and confidence
+auto_idx, auto_conf = auto_detect_references_start(text) if ref_msg == "No heading found" else (None, 1.0)
 
 st.subheader("References detection")
 st.write(ref_msg)
 
+# Fail-safe: if heading not found OR confidence is low, force manual selection by default
+force_manual = (ref_msg == "No heading found") and (auto_conf < 0.60)
 manual = st.checkbox(
     "Manually choose where References start (recommended if heading not found)",
-    value=(ref_msg == "No heading found")
+    value=force_manual or (ref_msg == "No heading found"),
 )
 
 if manual:
     lines = text.splitlines()
-    guess = auto_detect_references_start(text)
+    guess = auto_idx if auto_idx is not None else max(0, int(len(lines) * 0.70))
     idx = st.slider("Select the line where the References section starts", 0, max(0, len(lines) - 1), guess)
     main_text = "\n".join(lines[:idx]).strip()
     ref_text = "\n".join(lines[idx:]).strip()
 
+# Diagnostics so you can immediately see if the split is wrong
+st.caption(f"Main text length: {len(main_text):,} chars | References length: {len(ref_text):,} chars")
+with st.expander("Sanity check: end of main text"):
+    st.text(main_text[-3500:] if main_text else "")
+
 with st.expander("Preview detected References section"):
-    st.text(ref_text[:4000] if ref_text else "No references detected yet")
+    st.text(ref_text[:8000] if ref_text else "No references detected yet")
 
 if not ref_text.strip():
     st.warning("References section is empty. Paste your References or adjust the slider.")
-    ref_text = st.text_area("Paste References section here", height=220)
+    ref_text = st.text_area("Paste References section here", height=240)
 
 # Extract citations and references
 if style.startswith("APA/Harvard"):
@@ -782,9 +858,11 @@ else:
     refs = [parse_reference_numeric(r) for r in ref_raw]
     refs = [r for r in refs if r is not None]
 
+# Build key lists
 cite_keys = [c.key for c in cites]
 ref_keys = [r.key for r in refs]
 
+# Missing / uncited (accurate check)
 missing_keys = sorted(set(cite_keys) - set(ref_keys))
 uncited_keys = sorted(set(ref_keys) - set(cite_keys))
 
@@ -798,7 +876,7 @@ if missing_keys and ref_keys:
         matches = process.extract(mk, ref_keys, scorer=fuzz.WRatio, limit=5)
         suggestions[mk] = [f"{m[0]} ({int(m[1])})" for m in matches if m[1] >= 75]
 
-# Build user-friendly tables (show pretty labels, not raw keys)
+# User-friendly labels
 key_to_pretty_cite = {}
 for c in cites:
     key_to_pretty_cite[c.key] = c.pretty
@@ -848,15 +926,29 @@ c1, c2 = st.columns(2)
 
 with c1:
     st.markdown("### Cited in-text but missing in References")
-    st.dataframe(df_missing, use_container_width=True)
-    st.download_button("Download missing (CSV)", df_missing.to_csv(index=False).encode("utf-8"),
-                       file_name="missing_in_references.csv", mime="text/csv")
+    if df_missing.empty:
+        st.info("None detected.")
+    else:
+        st.dataframe(df_missing, use_container_width=True)
+    st.download_button(
+        "Download missing (CSV)",
+        df_missing.to_csv(index=False).encode("utf-8"),
+        file_name="missing_in_references.csv",
+        mime="text/csv"
+    )
 
 with c2:
     st.markdown("### In References but never cited")
-    st.dataframe(df_uncited, use_container_width=True)
-    st.download_button("Download uncited (CSV)", df_uncited.to_csv(index=False).encode("utf-8"),
-                       file_name="uncited_references.csv", mime="text/csv")
+    if df_uncited.empty:
+        st.info("None detected.")
+    else:
+        st.dataframe(df_uncited, use_container_width=True)
+    st.download_button(
+        "Download uncited (CSV)",
+        df_uncited.to_csv(index=False).encode("utf-8"),
+        file_name="uncited_references.csv",
+        mime="text/csv"
+    )
 
 st.divider()
 st.markdown("### Year mismatches (same author/org, different year)")
@@ -865,8 +957,12 @@ if style.startswith("APA/Harvard"):
         st.success("No year mismatches detected.")
     else:
         st.dataframe(df_mismatch, use_container_width=True)
-        st.download_button("Download mismatches (CSV)", df_mismatch.to_csv(index=False).encode("utf-8"),
-                           file_name="year_mismatches.csv", mime="text/csv")
+        st.download_button(
+            "Download mismatches (CSV)",
+            df_mismatch.to_csv(index=False).encode("utf-8"),
+            file_name="year_mismatches.csv",
+            mime="text/csv"
+        )
 else:
     st.info("Year mismatch check applies to author–year styles only.")
 
@@ -879,24 +975,25 @@ st.subheader("Online verification (Crossref + OpenAlex)")
 enable_verify = st.checkbox("Enable online verification", value=False)
 use_crossref = st.checkbox("Use Crossref", value=True, disabled=not enable_verify)
 use_openalex = st.checkbox("Use OpenAlex", value=True, disabled=not enable_verify)
-throttle = st.slider("Throttle seconds between queries", 0.0, 2.0, 0.2, 0.1, disabled=not enable_verify)
+throttle = st.slider("Throttle seconds between queries", 0.0, 2.0, 0.25, 0.05, disabled=not enable_verify)
 
 df_verify = pd.DataFrame()
 
 if enable_verify:
-    # Connectivity test
+    # Connectivity test (only if Crossref enabled)
     test_ok = True
     test_msg = ""
-    try:
-        _ = _get_json("https://api.crossref.org/works", {"rows": 1})
-    except Exception as e:
-        test_ok = False
-        test_msg = str(e)[:220]
+    if use_crossref:
+        try:
+            _ = _get_json("https://api.crossref.org/works", {"rows": 1})
+        except Exception as e:
+            test_ok = False
+            test_msg = str(e)[:220]
 
-    if not test_ok and use_crossref:
+    if (use_crossref and not test_ok) and (not use_openalex):
         st.error("Online verification can’t reach Crossref from this deployment.")
         st.write(f"Error: {test_msg}")
-        st.info("If this is Streamlit Cloud: check secrets/proxy settings, redeploy, and avoid too many rapid requests.")
+        st.info("On Streamlit Cloud, redeploy and avoid rapid repeated queries. Also check if your network blocks outbound requests.")
     else:
         rows = []
         progress = st.progress(0)
@@ -926,8 +1023,12 @@ if enable_verify:
 
         df_verify = pd.DataFrame(rows)
         st.dataframe(df_verify, use_container_width=True)
-        st.download_button("Download verification (CSV)", df_verify.to_csv(index=False).encode("utf-8"),
-                           file_name="online_verification.csv", mime="text/csv")
+        st.download_button(
+            "Download verification (CSV)",
+            df_verify.to_csv(index=False).encode("utf-8"),
+            file_name="online_verification.csv",
+            mime="text/csv"
+        )
 
         flagged = df_verify[df_verify["status"].isin(["not_found", "needs_review"])]
         if len(flagged) > 0:
@@ -938,14 +1039,22 @@ if enable_verify:
 # -----------------------------
 st.divider()
 pdf_bytes = make_pdf_report(style, summary, df_missing, df_uncited, df_mismatch, df_verify)
-st.download_button("Download full PDF report", data=pdf_bytes,
-                   file_name="citation_crosscheck_report.pdf", mime="application/pdf")
+st.download_button(
+    "Download full PDF report",
+    data=pdf_bytes,
+    file_name="citation_crosscheck_report.pdf",
+    mime="application/pdf"
+)
 
-# Debug tabs
+# -----------------------------
+# Debug
+# -----------------------------
 with st.expander("Extracted items (debug)"):
-    tab1, tab2 = st.tabs(["In-text citations", "Reference entries"])
+    tab1, tab2, tab3 = st.tabs(["In-text citations", "Reference entries", "Raw reference splits"])
     with tab1:
         st.dataframe(pd.DataFrame([c.__dict__ for c in cites]), use_container_width=True)
     with tab2:
         st.dataframe(pd.DataFrame([r.__dict__ for r in refs]), use_container_width=True)
-
+    with tab3:
+        st.write(f"Split into {len(ref_raw)} raw entries")
+        st.text("\n\n---\n\n".join(ref_raw[:20]))
