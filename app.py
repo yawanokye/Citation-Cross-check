@@ -604,7 +604,7 @@ def find_year_mismatches(cite_keys: List[str], ref_keys: List[str]) -> pd.DataFr
 # =============================
 def build_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "citation-crosscheck/1.3"})
+    s.headers.update({"User-Agent": "citation-crosscheck/1.4"})
     return s
 
 SESSION = build_session()
@@ -635,7 +635,7 @@ def extract_doi(text: str) -> Optional[str]:
 
     doi = doi.strip().strip(").,;:]}>\"'")
     doi = re.sub(r"&quot;|&gt;|&lt;|&amp;", "", doi)
-    return doi if doi.startswith("10.") else None
+    return doi if doi.lower().startswith("10.") else None
 
 @st.cache_data(show_spinner=False)
 def crossref_lookup_by_doi(doi: str) -> Optional[dict]:
@@ -646,142 +646,253 @@ def crossref_lookup_by_doi(doi: str) -> Optional[dict]:
         return None
 
 @st.cache_data(show_spinner=False)
-def crossref_search(query: str, rows: int = 5) -> List[dict]:
+def crossref_search(query: str, rows: int = 10) -> List[dict]:
     data = _get_json(CROSSREF_API, params={"query.bibliographic": query, "rows": rows})
     return data.get("message", {}).get("items", []) or []
 
 @st.cache_data(show_spinner=False)
-def openalex_search(query: str, per_page: int = 5) -> List[dict]:
+def openalex_search(query: str, per_page: int = 10) -> List[dict]:
     data = _get_json(OPENALEX_API, params={"search": query, "per-page": per_page})
     return data.get("results", []) or []
 
-def guess_title_snippet(ref: str) -> str:
 
+# ---- Strict metadata helpers ----
+def _as_int_year(y: Optional[str]) -> Optional[int]:
+    if not y:
+        return None
+    m = re.search(r"(19|20)\d{2}", str(y))
+    return int(m.group(0)) if m else None
+
+def crossref_item_year(it: dict) -> Optional[int]:
+    issued = it.get("issued", {}).get("date-parts", [])
+    if issued and issued[0]:
+        try:
+            return int(issued[0][0])
+        except Exception:
+            pass
+    created = it.get("created", {}).get("date-parts", [])
+    if created and created[0]:
+        try:
+            return int(created[0][0])
+        except Exception:
+            pass
+    published_print = it.get("published-print", {}).get("date-parts", [])
+    if published_print and published_print[0]:
+        try:
+            return int(published_print[0][0])
+        except Exception:
+            pass
+    return None
+
+def crossref_first_author_family(it: dict) -> str:
+    authors = it.get("author") or []
+    fam = authors[0].get("family") if authors else ""
+    return fam or ""
+
+def crossref_title(it: dict) -> str:
+    t = it.get("title") or []
+    return (t[0] if t else "") or ""
+
+def openalex_year(it: dict) -> Optional[int]:
+    y = it.get("publication_year")
+    try:
+        return int(y) if y else None
+    except Exception:
+        return None
+
+def openalex_first_author_family(it: dict) -> str:
+    authorships = it.get("authorships") or []
+    if not authorships:
+        return ""
+    dn = (authorships[0].get("author") or {}).get("display_name") or ""
+    return (dn.split()[-1] if dn else "") or ""
+
+def openalex_title(it: dict) -> str:
+    return (it.get("title") or "") or ""
+
+def openalex_doi(it: dict) -> str:
+    ids = it.get("ids") or {}
+    d = ids.get("doi") or ""
+    if d:
+        d = d.replace("https://doi.org/", "").strip()
+        d = d.strip(").,;:]}>\"'")
+    return d
+
+def author_match_ok(ref_surname: str, cand_surname: str) -> bool:
+    if not ref_surname or not cand_surname:
+        return False
+    return norm_token(ref_surname) == norm_token(cand_surname)
+
+def year_match_ok(ref_year: Optional[int], cand_year: Optional[int]) -> bool:
+    if ref_year is None or cand_year is None:
+        return False
+    if ref_year == cand_year:
+        return True
+    # allow ±1 for online-first vs print, editions
+    return abs(ref_year - cand_year) == 1
+
+
+def guess_title_snippet(ref: str) -> str:
     r = _strip_leading_numbering(ref)
+    # drop year-parentheses chunk
     t = re.sub(rf"\(.*?{YEAR}.*?\)", " ", r)
+    # drop first segment up to first period (usually author list)
     t = re.sub(r"^[^\.]{1,180}\.\s*", " ", t)
     t = norm_spaces(t)
     words = t.split()
-    return " ".join(words[:14])[:180]
+    return " ".join(words[:18])[:220]  # slightly longer improves title scoring
 
-def verify_reference_online(ref_obj: ReferenceEntry,
-                            throttle_s: float = 0.2,
-                            use_crossref: bool = True,
-                            use_openalex: bool = True) -> dict:
+
+def verify_reference_online(
+    ref_obj: ReferenceEntry,
+    throttle_s: float = 0.2,
+    use_crossref: bool = True,
+    use_openalex: bool = True
+) -> dict:
     """
-    Uses parsed year/author/org from ReferenceEntry to build better queries.
-    Avoids picking up issue/page numbers as "year".
+    Strict verification:
+    - If DOI exists: verify by DOI only (no search guessing)
+    - Else: require (author/org + year) agreement before accepting a candidate
+    - Score mainly on title similarity after passing the gates
     """
-    ref_entry = ref_obj.raw
+    ref_entry = ref_obj.raw or ""
     doi = extract_doi(ref_entry)
 
-    y = (ref_obj.year or "").strip()
+    ref_year = _as_int_year(ref_obj.year)
     who = (ref_obj.author_or_org or "").strip()
+    who_is_org = ref_obj.key.startswith("org_")
+
+    # Enforce only plausible person surname for author-year items
+    ref_surname = who if (who and not who_is_org and looks_like_person_surname(who)) else ""
+
     title_snip = guess_title_snippet(ref_entry)
 
-    # DOI first (strongest)
+    # ---- DOI first (strongest) ----
     if doi and use_crossref:
         cr = crossref_lookup_by_doi(doi)
         if cr:
-            issued = cr.get("issued", {}).get("date-parts", [])
-            year = str(issued[0][0]) if issued and issued[0] else ""
-            title = (cr.get("title") or [""])[0] if cr.get("title") else ""
-            authors = cr.get("author") or []
-            fam = authors[0].get("family") if authors else ""
+            y = crossref_item_year(cr)
+            fam = crossref_first_author_family(cr)
+            title = crossref_title(cr)
             return {
                 "status": "verified",
-                "source": "crossref",
+                "source": "crossref_doi",
+                "score": 100,
                 "doi": doi,
-                "matched_year": year,
+                "matched_year": str(y or ""),
                 "matched_first_author": fam,
                 "matched_title": (title or "")[:180],
-                "query_used": "doi"
+                "query_used": "doi_lookup",
             }
+        return {
+            "status": "not_found",
+            "source": "crossref_doi",
+            "score": 0,
+            "doi": doi,
+            "matched_year": "",
+            "matched_first_author": "",
+            "matched_title": "",
+            "query_used": "doi_lookup",
+        }
 
-    # Build compact, high-signal query
+    # ---- Build query (high signal, less noise) ----
     parts = []
     if who:
         parts.append(who)
-    if y:
-        parts.append(y)
+    if ref_year:
+        parts.append(str(ref_year))
     if title_snip:
         parts.append(title_snip)
 
-    query = " ".join(parts).strip()
-    if not query:
-        query = _strip_leading_numbering(ref_entry)[:200]
+    query = " ".join(parts).strip() or _strip_leading_numbering(ref_entry)[:200]
 
     time.sleep(max(0.0, throttle_s))
 
-    best = {"status": "not_found", "source": "", "score": 0, "doi": "", "query_used": query[:220]}
+    best = {
+        "status": "not_found",
+        "source": "",
+        "score": 0,
+        "doi": "",
+        "matched_year": "",
+        "matched_first_author": "",
+        "matched_title": "",
+        "query_used": query[:220],
+        "error_crossref": "",
+        "error_openalex": "",
+    }
 
-    # Crossref search
+    # ---- Crossref (strict gates) ----
     if use_crossref:
         try:
-            items = crossref_search(query, rows=5)
+            items = crossref_search(query, rows=10)
             for it in items:
-                title = (it.get("title") or [""])[0] if it.get("title") else ""
-                issued = it.get("issued", {}).get("date-parts", [])
-                year = str(issued[0][0]) if issued and issued[0] else ""
-                authors = it.get("author") or []
-                fam = authors[0].get("family") if authors else ""
+                cand_year = crossref_item_year(it)
+                cand_fam = crossref_first_author_family(it)
+                cand_title = crossref_title(it)
+                cand_doi = (it.get("DOI") or "").strip()
 
-                cand = f"{fam} {year} {title}"
-                score = fuzz.WRatio(query, cand)
+                # Gate 1: author/org agreement
+                if who_is_org:
+                    # for org refs, we can't reliably match author family, so skip author gate
+                    pass
+                else:
+                    if ref_surname and not author_match_ok(ref_surname, cand_fam):
+                        continue
 
-                # If we have a parsed year, penalise mismatched years
-                if y and year and year != y:
-                    score = int(score * 0.85)
+                # Gate 2: year agreement (if we have a parsed year)
+                if ref_year and not year_match_ok(ref_year, cand_year):
+                    continue
 
+                # Score: title similarity dominates
+                score = fuzz.WRatio(title_snip, cand_title) if title_snip and cand_title else 80
                 if score > best["score"]:
                     best = {
-                        "status": "likely" if score >= 82 else "needs_review",
+                        "status": "verified" if score >= 82 else "needs_review",
                         "source": "crossref",
                         "score": int(score),
-                        "doi": (it.get("DOI") or "").strip(),
-                        "matched_year": year,
-                        "matched_first_author": fam,
-                        "matched_title": (title or "")[:180],
+                        "doi": cand_doi,
+                        "matched_year": str(cand_year or ""),
+                        "matched_first_author": cand_fam,
+                        "matched_title": (cand_title or "")[:180],
                         "query_used": query[:220],
+                        "error_crossref": "",
+                        "error_openalex": best.get("error_openalex", ""),
                     }
         except Exception as e:
             best["error_crossref"] = str(e)[:220]
 
-    # OpenAlex search
+    # ---- OpenAlex (strict gates) ----
     if use_openalex:
         try:
-            items = openalex_search(query, per_page=5)
+            items = openalex_search(query, per_page=10)
             for it in items:
-                title = it.get("title") or ""
-                year = str(it.get("publication_year") or "")
-                authorships = it.get("authorships") or []
-                fa = ""
-                if authorships:
-                    dn = (authorships[0].get("author") or {}).get("display_name") or ""
-                    fa = dn.split()[-1] if dn else ""
+                cand_year = openalex_year(it)
+                cand_fam = openalex_first_author_family(it)
+                cand_title = openalex_title(it)
+                cand_doi = openalex_doi(it)
 
-                cand = f"{fa} {year} {title}"
-                score = fuzz.WRatio(query, cand)
+                if who_is_org:
+                    pass
+                else:
+                    if ref_surname and not author_match_ok(ref_surname, cand_fam):
+                        continue
 
-                if y and year and year != y:
-                    score = int(score * 0.85)
+                if ref_year and not year_match_ok(ref_year, cand_year):
+                    continue
 
-                if score > best.get("score", 0):
-                    doi2 = ""
-                    ids = it.get("ids") or {}
-                    if ids.get("doi"):
-                        doi2 = ids["doi"].replace("https://doi.org/", "").strip()
-                        doi2 = doi2.strip(").,;:]}>\"'")
-
+                score = fuzz.WRatio(title_snip, cand_title) if title_snip and cand_title else 80
+                if score > best["score"]:
                     best = {
-                        "status": "likely" if score >= 82 else "needs_review",
+                        "status": "verified" if score >= 82 else "needs_review",
                         "source": "openalex",
                         "score": int(score),
-                        "doi": doi2,
-                        "matched_year": year,
-                        "matched_first_author": fa,
-                        "matched_title": (title or "")[:180],
+                        "doi": cand_doi,
+                        "matched_year": str(cand_year or ""),
+                        "matched_first_author": cand_fam,
+                        "matched_title": (cand_title or "")[:180],
                         "query_used": query[:220],
+                        "error_crossref": best.get("error_crossref", ""),
+                        "error_openalex": "",
                     }
         except Exception as e:
             best["error_openalex"] = str(e)[:220]
@@ -1143,5 +1254,6 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
