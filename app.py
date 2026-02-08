@@ -159,6 +159,32 @@ def _first_surname_from_author_blob(blob: str) -> Optional[str]:
 
     m = re.search(r"([A-Z][A-Za-z\-']+)", first)
     return m.group(1) if m else None
+NONNAME_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "as", "by",
+    "from", "into", "at", "than", "that", "this", "these", "those",
+    "recent", "minimum", "maximum", "mathematical", "basis", "adopting", "adopt", "model",
+    "framework", "table", "figure", "chapter", "section", "appendix", "equation",
+    "definition", "method", "methods", "result", "results", "discussion"
+}
+
+def looks_like_person_surname(token: str) -> bool:
+    if not token:
+        return False
+    t = token.strip()
+
+    # reject possessive like Adam's / Adam’s
+    if re.search(r"(?:'s|’s)$", t, flags=re.IGNORECASE):
+        return False
+
+    # basic surname pattern (allows Al-Majali)
+    if not re.fullmatch(r"[A-Z][A-Za-z\-']{1,40}", t):
+        return False
+
+    # reject common non-name words
+    if norm_token(t) in NONNAME_STOPWORDS:
+        return False
+
+    return True
 
 
 # =============================
@@ -283,26 +309,25 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
     out: List[InTextCitation] = []
 
     # -----------------------------
-    # Narrative citations (NON-parenthetical):
-    # Examples:
+    # Narrative citations (NON-parenthetical) for PEOPLE only:
     #   Kofi (2023)
     #   Kofi and Ama (2023)
     #   Kofi, Ama and Kwame (2023)
-    #   Kofi, Ama, Kwame, and Yaw (2023)
     #   Kofi et al. (2023)
-    #   World Bank (2023)
+    #
+    # IMPORTANT: We intentionally DO NOT accept "org-ish" catch-all here,
+    # because it creates false positives like "Mathematical (2020)".
+    # Organisations are handled separately (only known orgs).
     # -----------------------------
-    narr = re.compile(
+    narr_people = re.compile(
         rf"""
         \b
         (?P<authors>
-            [A-Z][A-Za-z\-']+                              # first surname
-            (?:\s*,\s*[A-Z][A-Za-z\-']+)*                  # optional ", Ama, Kwame"
-            (?:\s*,?\s*(?:and|&)\s*[A-Z][A-Za-z\-']+)?     # optional "and Yaw"
+            [A-Z][A-Za-z\-']+                                  # first surname
+            (?:\s*,\s*[A-Z][A-Za-z\-']+)*                      # optional ", Ama, Kwame"
+            (?:\s*,?\s*(?:and|&)\s*[A-Z][A-Za-z\-']+)?         # optional "and Yaw"
             |
-            [A-Z][A-Za-z\-']+\s+et\s+al\.                  # "Kofi et al."
-            |
-            [A-Z][A-Za-z&.\- ]{{2,}}?                      # org-ish
+            [A-Z][A-Za-z\-']+\s+et\s+al\.                      # "Kofi et al."
         )
         \s*
         \(\s*(?P<year>{YEAR})\s*\)
@@ -310,27 +335,44 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         flags=re.VERBOSE
     )
 
-    for m in narr.finditer(text):
+    for m in narr_people.finditer(text):
         authors_blob = m.group("authors").strip()
         y = m.group("year")
 
         # strip trailing et al. for keying
         authors_blob_clean = re.sub(r"\s+et\s+al\.\s*$", "", authors_blob, flags=re.IGNORECASE).strip()
-
         first = _first_surname_from_author_blob(authors_blob_clean) or authors_blob_clean.split(",")[0].strip()
 
-        if is_known_org(first) and not looks_like_two_authors(first):
-            key = key_org_year(first, y)
-            pretty = f"{titleish(first)}, {y}"
-            out.append(InTextCitation("org-year", m.group(0), key, pretty, first, y))
-        else:
-            key = key_author_year(first, y)
-            pretty = f"{titleish(first)}, {y}"
-            out.append(InTextCitation("author-year", m.group(0), key, pretty, first, y))
+        # Block false positives like "The (2020)", "Mathematical (2020)", "Minimum (1991)", "Adam's (2020)"
+        if not looks_like_person_surname(first):
+            continue
+
+        key = key_author_year(first, y)
+        pretty = f"{titleish(first)}, {y}"
+        out.append(InTextCitation("author-year", m.group(0), key, pretty, first, y))
+
+    # -----------------------------
+    # Narrative citations for ORGANISATIONS (STRICT: known orgs only):
+    #   UNCTAD (2025)
+    #   World Bank (2023)
+    # -----------------------------
+    narr_org = re.compile(rf"\b([A-Z][A-Za-z&.\- ]{{2,}}?)\s*\(\s*({YEAR})\s*\)")
+    for m in narr_org.finditer(text):
+        org, y = m.group(1).strip(), m.group(2)
+
+        # Stop false positives like "Saslavsky Shepherd (2014)"
+        if looks_like_two_authors(org):
+            continue
+
+        # Only accept organisations we recognise
+        if is_known_org(org):
+            key = key_org_year(org, y)
+            pretty = f"{titleish(org)}, {y}"
+            out.append(InTextCitation("org-year", m.group(0), key, pretty, org, y))
 
     # -----------------------------
     # Parenthetical blocks:
-    # (Kofi, 2000; Mensah & Boateng, 2001; UNCTAD, 2025)
+    #   (Kofi, 2000; Mensah & Boateng, 2001; UNCTAD, 2025)
     # -----------------------------
     paren_block = re.compile(rf"\(([^()]*?\b{YEAR}\b[^()]*)\)")
     for m in paren_block.finditer(text):
@@ -349,24 +391,25 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             if m_left:
                 left = m_left.group(1).strip()
 
+            # Organisation inside parentheses: (UNCTAD, 2025)
             if is_known_org(left) and not looks_like_two_authors(left):
                 key = key_org_year(left, y)
                 pretty = f"{titleish(left)}, {y}"
                 out.append(InTextCitation("org-year", f"({p})", key, pretty, left, y))
                 continue
 
+            # People: extract first surname and validate
             first_author = _first_surname_from_author_blob(left) or _first_surname_from_author_blob(p)
             if not first_author:
                 continue
 
-            if is_known_org(first_author) and not looks_like_two_authors(first_author):
-                key = key_org_year(first_author, y)
-                pretty = f"{titleish(first_author)}, {y}"
-                out.append(InTextCitation("org-year", f"({p})", key, pretty, first_author, y))
-            else:
-                key = key_author_year(first_author, y)
-                pretty = f"{titleish(first_author)}, {y}"
-                out.append(InTextCitation("author-year", f"({p})", key, pretty, first_author, y))
+            # if the extracted token isn't a plausible surname, skip it
+            if not looks_like_person_surname(first_author):
+                continue
+
+            key = key_author_year(first_author, y)
+            pretty = f"{titleish(first_author)}, {y}"
+            out.append(InTextCitation("author-year", f"({p})", key, pretty, first_author, y))
 
     return out
 
@@ -612,6 +655,7 @@ def openalex_search(query: str, per_page: int = 5) -> List[dict]:
     return data.get("results", []) or []
 
 def guess_title_snippet(ref: str) -> str:
+
     r = _strip_leading_numbering(ref)
     t = re.sub(rf"\(.*?{YEAR}.*?\)", " ", r)
     t = re.sub(r"^[^\.]{1,180}\.\s*", " ", t)
@@ -1098,3 +1142,4 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
