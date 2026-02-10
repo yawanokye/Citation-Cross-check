@@ -170,7 +170,7 @@ NONNAME_STOPWORDS = {
     "definition", "method", "methods", "result", "results", "discussion",
     "similarly", "moreover", "however", "therefore", "thus", "also", "further", "additionally",
     "consequently", "notably", "specifically", "generally", "overall", "first", "second", "finally",
-    "public", "construct"
+    "public", "construct", "Africa", "Europe", "America"
 }
 
 def looks_like_person_surname(token: str) -> bool:
@@ -1298,4 +1298,5 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
