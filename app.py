@@ -348,9 +348,23 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         if not looks_like_person_surname(first):
             continue
 
-        key = key_author_year(first, y)
-        pretty = f"{titleish(first)}, {y}"
-        out.append(InTextCitation("author-year", m.group(0), key, pretty, first, y))
+        # keep the full author string as written in text (e.g. "Kofi & Kwame", "Adu et al.")
+disp_authors = format_author_blob_for_display(authors_blob)
+
+key = key_author_year(first, y)   # internal matching key stays the same
+pretty = f"{disp_authors}, {y}"   # display what the user actually wrote
+
+out.append(
+    InTextCitation(
+        "author-year",
+        m.group(0),
+        key,
+        pretty,
+        first,
+        y
+    )
+)
+
 
     # -----------------------------
     # Narrative citations for ORGANISATIONS (STRICT: known orgs only):
@@ -1255,6 +1269,7 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
 
