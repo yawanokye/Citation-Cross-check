@@ -1005,6 +1005,24 @@ def make_pdf_report(style_name: str,
 # Streamlit UI
 # =============================
 st.set_page_config(page_title="Citation Crosschecker", layout="wide")
+# =============================
+# Footer: Copyright + Disclaimer
+# =============================
+st.markdown(
+    """
+<div style="margin-top:6px; margin-bottom:10px; padding:10px 12px; border:1px solid #e6e6e6; border-radius:10px;">
+  <div style="font-size:13px; font-weight:600;">
+    © Prof. Anokye M. Adam
+  </div>
+  <div style="font-size:12px; margin-top:6px; line-height:1.35;">
+    Disclaimer: This tool can make mistakes, including missed or incorrect citation matches and online metadata errors.
+    Always verify results against your manuscript, style guide, and original sources before submission.
+  </div>
+</div>
+""",
+    unsafe_allow_html=True
+)
+
 st.title("Citation Crosschecker")
 
 col1, col2 = st.columns(2)
@@ -1280,3 +1298,4 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
