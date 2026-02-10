@@ -1,3 +1,4 @@
+# app.py
 import re
 import time
 from dataclasses import dataclass
@@ -71,9 +72,9 @@ ORG_ACRONYMS = {
 @dataclass
 class InTextCitation:
     style: str                  # author-year | org-year | numeric
-    raw: str
-    key: str                    # internal key (stable)
-    pretty: str                 # display e.g., "Kofi, 2000"
+    raw: str                    # exact matched string from text (best for display)
+    key: str                    # internal matching key
+    pretty: str                 # display label (shown in tables/PDF)
     author_or_org: Optional[str] = None
     year: Optional[str] = None
     number: Optional[int] = None
@@ -81,9 +82,9 @@ class InTextCitation:
 
 @dataclass
 class ReferenceEntry:
-    raw: str
-    key: str
-    pretty: str
+    raw: str                    # full reference entry (keep full for display)
+    key: str                    # internal matching key
+    pretty: str                 # short label (optional)
     author_or_org: Optional[str] = None
     year: Optional[str] = None
     number: Optional[int] = None
@@ -159,13 +160,17 @@ def _first_surname_from_author_blob(blob: str) -> Optional[str]:
 
     m = re.search(r"([A-Z][A-Za-z\-']+)", first)
     return m.group(1) if m else None
+
+# Words that often show up before "(YEAR)" but are NOT surnames
 NONNAME_STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "as", "by",
     "from", "into", "at", "than", "that", "this", "these", "those",
     "recent", "minimum", "maximum", "mathematical", "basis", "adopting", "adopt", "model",
     "framework", "table", "figure", "chapter", "section", "appendix", "equation",
-    "definition", "method", "methods", "result", "results", "discussion", "similarly", "moreover", "however", "therefore", "thus", "also", "further", "additionally",
-"consequently", "notably", "specifically", "generally", "overall", "first", "second", "finally", "public", "World", "bank", "construct"
+    "definition", "method", "methods", "result", "results", "discussion",
+    "similarly", "moreover", "however", "therefore", "thus", "also", "further", "additionally",
+    "consequently", "notably", "specifically", "generally", "overall", "first", "second", "finally",
+    "public", "construct"
 }
 
 def looks_like_person_surname(token: str) -> bool:
@@ -186,6 +191,24 @@ def looks_like_person_surname(token: str) -> bool:
         return False
 
     return True
+
+def format_author_blob_for_display(authors_blob: str) -> str:
+    """
+    Keeps the author string the user wrote, but normalises spacing.
+    Examples:
+      "Kofi and Ama" -> "Kofi and Ama"
+      "Kofi, Ama and Kwame" -> "Kofi, Ama and Kwame"
+      "Adu et al." -> "Adu et al."
+      "Mensah&Boateng" -> "Mensah & Boateng"
+    """
+    if not authors_blob:
+        return ""
+    s = authors_blob.strip()
+    s = re.sub(r"\s*&\s*", " & ", s)
+    s = re.sub(r"\s+and\s+", " and ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*,\s*", ", ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 # =============================
@@ -273,7 +296,6 @@ def ref_line_score(line: str) -> int:
 def auto_detect_references_start(text: str) -> Tuple[int, float]:
     """
     Returns (best_line_index, confidence_score 0..1).
-    Confidence is based on how strong the window scoring peak is.
     """
     lines = text.splitlines()
     if len(lines) < 40:
@@ -315,10 +337,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
     #   Kofi and Ama (2023)
     #   Kofi, Ama and Kwame (2023)
     #   Kofi et al. (2023)
-    #
-    # IMPORTANT: We intentionally DO NOT accept "org-ish" catch-all here,
-    # because it creates false positives like "Mathematical (2020)".
-    # Organisations are handled separately (only known orgs).
+    # Also handles "Similarly, Xue (2002)" because we match at the surname token.
     # -----------------------------
     narr_people = re.compile(
         rf"""
@@ -340,7 +359,6 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         authors_blob = m.group("authors").strip()
         y = m.group("year")
 
-        # strip trailing et al. for keying
         authors_blob_clean = re.sub(r"\s+et\s+al\.\s*$", "", authors_blob, flags=re.IGNORECASE).strip()
         first = _first_surname_from_author_blob(authors_blob_clean) or authors_blob_clean.split(",")[0].strip()
 
@@ -348,23 +366,12 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         if not looks_like_person_surname(first):
             continue
 
-        # keep the full author string as written in text (e.g. "Kofi & Kwame", "Adu et al.")
-disp_authors = format_author_blob_for_display(authors_blob)
+        disp_authors = format_author_blob_for_display(authors_blob)
+        key = key_author_year(first, y)
 
-key = key_author_year(first, y)   # internal matching key stays the same
-pretty = f"{disp_authors}, {y}"   # display what the user actually wrote
-
-out.append(
-    InTextCitation(
-        "author-year",
-        m.group(0),
-        key,
-        pretty,
-        first,
-        y
-    )
-)
-
+        # Display the actual in-text citation string (authors as written + year)
+        pretty = f"{disp_authors} ({y})"
+        out.append(InTextCitation("author-year", m.group(0), key, pretty, first, y))
 
     # -----------------------------
     # Narrative citations for ORGANISATIONS (STRICT: known orgs only):
@@ -379,15 +386,15 @@ out.append(
         if looks_like_two_authors(org):
             continue
 
-        # Only accept organisations we recognise
         if is_known_org(org):
             key = key_org_year(org, y)
-            pretty = f"{titleish(org)}, {y}"
+            pretty = f"{titleish(org)} ({y})"
             out.append(InTextCitation("org-year", m.group(0), key, pretty, org, y))
 
     # -----------------------------
     # Parenthetical blocks:
     #   (Kofi, 2000; Mensah & Boateng, 2001; UNCTAD, 2025)
+    # For display: keep the exact segment, not just "FirstAuthor, Year".
     # -----------------------------
     paren_block = re.compile(rf"\(([^()]*?\b{YEAR}\b[^()]*)\)")
     for m in paren_block.finditer(text):
@@ -406,10 +413,10 @@ out.append(
             if m_left:
                 left = m_left.group(1).strip()
 
-            # Organisation inside parentheses: (UNCTAD, 2025)
+            # Organisation: (UNCTAD, 2025)
             if is_known_org(left) and not looks_like_two_authors(left):
                 key = key_org_year(left, y)
-                pretty = f"{titleish(left)}, {y}"
+                pretty = f"({p})"
                 out.append(InTextCitation("org-year", f"({p})", key, pretty, left, y))
                 continue
 
@@ -417,13 +424,11 @@ out.append(
             first_author = _first_surname_from_author_blob(left) or _first_surname_from_author_blob(p)
             if not first_author:
                 continue
-
-            # if the extracted token isn't a plausible surname, skip it
             if not looks_like_person_surname(first_author):
                 continue
 
             key = key_author_year(first_author, y)
-            pretty = f"{titleish(first_author)}, {y}"
+            pretty = f"({p})"
             out.append(InTextCitation("author-year", f"({p})", key, pretty, first_author, y))
 
     return out
@@ -509,6 +514,7 @@ def split_reference_entries(ref_text: str) -> List[str]:
     if buf:
         entries.append(buf.strip())
 
+    # If everything was one big blob, try splitting by numbering again
     if len(entries) == 1:
         big = entries[0]
         chunks = re.split(r"(?=(?:\s|^)(?:\[\d+\]|\d+[\.\)])\s+)", big)
@@ -532,7 +538,7 @@ def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
         org, y = org_m.group(1).strip(), org_m.group(2)
         if is_known_org(org):
             key = key_org_year(org, y)
-            pretty = f"{titleish(org)}, {y}"
+            pretty = f"{titleish(org)} ({y})"
             return ReferenceEntry(entry, key, pretty, org, y)
 
     # Organisation: World Bank (2023). ... OR World Bank. (2023). ...
@@ -541,7 +547,7 @@ def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
         org, y = org2.group(1).strip(), org2.group(2)
         if is_known_org(org) and not looks_like_two_authors(org):
             key = key_org_year(org, y)
-            pretty = f"{titleish(org)}, {y}"
+            pretty = f"{titleish(org)} ({y})"
             return ReferenceEntry(entry, key, pretty, org, y)
 
     # Author-year: Surname, X. (2020). ...
@@ -549,7 +555,7 @@ def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
     if m:
         au, y = m.group(1), m.group(2)
         key = key_author_year(au, y)
-        pretty = f"{titleish(au)}, {y}"
+        pretty = f"{titleish(au)} ({y})"
         return ReferenceEntry(entry, key, pretty, au, y)
 
     # Harvard-ish: Surname, X. ... 2020 ...
@@ -557,7 +563,7 @@ def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
     if m2:
         au, y = m2.group(1), m2.group(2)
         key = key_author_year(au, y)
-        pretty = f"{titleish(au)}, {y}"
+        pretty = f"{titleish(au)} ({y})"
         return ReferenceEntry(entry, key, pretty, au, y)
 
     return None
@@ -633,7 +639,7 @@ def extract_doi(text: str) -> Optional[str]:
     """
     Safer DOI extraction:
     - supports https://doi.org/...
-    - strips trailing punctuation like ")."
+    - strips trailing punctuation
     """
     if not text:
         return None
@@ -649,6 +655,7 @@ def extract_doi(text: str) -> Optional[str]:
 
     doi = doi.strip().strip(").,;:]}>\"'")
     doi = re.sub(r"&quot;|&gt;|&lt;|&amp;", "", doi)
+    doi = doi.strip().strip(").,;:]}>\"'")
     return doi if doi.lower().startswith("10.") else None
 
 @st.cache_data(show_spinner=False)
@@ -670,7 +677,6 @@ def openalex_search(query: str, per_page: int = 10) -> List[dict]:
     return data.get("results", []) or []
 
 
-# ---- Strict metadata helpers ----
 def _as_int_year(y: Optional[str]) -> Optional[int]:
     if not y:
         return None
@@ -684,16 +690,16 @@ def crossref_item_year(it: dict) -> Optional[int]:
             return int(issued[0][0])
         except Exception:
             pass
-    created = it.get("created", {}).get("date-parts", [])
-    if created and created[0]:
-        try:
-            return int(created[0][0])
-        except Exception:
-            pass
     published_print = it.get("published-print", {}).get("date-parts", [])
     if published_print and published_print[0]:
         try:
             return int(published_print[0][0])
+        except Exception:
+            pass
+    created = it.get("created", {}).get("date-parts", [])
+    if created and created[0]:
+        try:
+            return int(created[0][0])
         except Exception:
             pass
     return None
@@ -742,20 +748,18 @@ def year_match_ok(ref_year: Optional[int], cand_year: Optional[int]) -> bool:
         return False
     if ref_year == cand_year:
         return True
-    # allow ±1 for online-first vs print, editions
+    # allow ±1 for online-first vs print
     return abs(ref_year - cand_year) == 1
-
 
 def guess_title_snippet(ref: str) -> str:
     r = _strip_leading_numbering(ref)
     # drop year-parentheses chunk
     t = re.sub(rf"\(.*?{YEAR}.*?\)", " ", r)
     # drop first segment up to first period (usually author list)
-    t = re.sub(r"^[^\.]{1,180}\.\s*", " ", t)
+    t = re.sub(r"^[^\.]{1,220}\.\s*", " ", t)
     t = norm_spaces(t)
     words = t.split()
-    return " ".join(words[:18])[:220]  # slightly longer improves title scoring
-
+    return " ".join(words[:22])[:260]
 
 def verify_reference_online(
     ref_obj: ReferenceEntry,
@@ -764,10 +768,12 @@ def verify_reference_online(
     use_openalex: bool = True
 ) -> dict:
     """
-    Strict verification:
-    - If DOI exists: verify by DOI only (no search guessing)
-    - Else: require (author/org + year) agreement before accepting a candidate
-    - Score mainly on title similarity after passing the gates
+    Stricter verification to reduce wrong DOI/year/author matches.
+
+    Rules:
+    - If DOI exists: DOI lookup only.
+    - Else: accept a candidate only if (surname matches AND year matches) when it's an author-year ref.
+    - Score is based on title similarity after passing gates.
     """
     ref_entry = ref_obj.raw or ""
     doi = extract_doi(ref_entry)
@@ -776,12 +782,12 @@ def verify_reference_online(
     who = (ref_obj.author_or_org or "").strip()
     who_is_org = ref_obj.key.startswith("org_")
 
-    # Enforce only plausible person surname for author-year items
-    ref_surname = who if (who and not who_is_org and looks_like_person_surname(who)) else ""
+    # for author-year refs, enforce plausible surname
+    ref_surname = who if (who and (not who_is_org) and looks_like_person_surname(who)) else ""
 
     title_snip = guess_title_snippet(ref_entry)
 
-    # ---- DOI first (strongest) ----
+    # DOI first
     if doi and use_crossref:
         cr = crossref_lookup_by_doi(doi)
         if cr:
@@ -797,6 +803,8 @@ def verify_reference_online(
                 "matched_first_author": fam,
                 "matched_title": (title or "")[:180],
                 "query_used": "doi_lookup",
+                "error_crossref": "",
+                "error_openalex": "",
             }
         return {
             "status": "not_found",
@@ -807,9 +815,11 @@ def verify_reference_online(
             "matched_first_author": "",
             "matched_title": "",
             "query_used": "doi_lookup",
+            "error_crossref": "",
+            "error_openalex": "",
         }
 
-    # ---- Build query (high signal, less noise) ----
+    # Build query
     parts = []
     if who:
         parts.append(who)
@@ -819,7 +829,6 @@ def verify_reference_online(
         parts.append(title_snip)
 
     query = " ".join(parts).strip() or _strip_leading_numbering(ref_entry)[:200]
-
     time.sleep(max(0.0, throttle_s))
 
     best = {
@@ -835,7 +844,7 @@ def verify_reference_online(
         "error_openalex": "",
     }
 
-    # ---- Crossref (strict gates) ----
+    # Crossref
     if use_crossref:
         try:
             items = crossref_search(query, rows=10)
@@ -845,23 +854,24 @@ def verify_reference_online(
                 cand_title = crossref_title(it)
                 cand_doi = (it.get("DOI") or "").strip()
 
-                # Gate 1: author/org agreement
-                if who_is_org:
-                    # for org refs, we can't reliably match author family, so skip author gate
-                    pass
-                else:
+                # Gates
+                if not who_is_org:
                     if ref_surname and not author_match_ok(ref_surname, cand_fam):
                         continue
+                    if ref_year and not year_match_ok(ref_year, cand_year):
+                        continue
+                else:
+                    # For org refs, we gate mostly by year if present
+                    if ref_year and not year_match_ok(ref_year, cand_year):
+                        continue
 
-                # Gate 2: year agreement (if we have a parsed year)
-                if ref_year and not year_match_ok(ref_year, cand_year):
-                    continue
+                score = fuzz.WRatio(title_snip, cand_title) if (title_snip and cand_title) else 70
 
-                # Score: title similarity dominates
-                score = fuzz.WRatio(title_snip, cand_title) if title_snip and cand_title else 80
+                status = "verified" if score >= 90 else ("likely" if score >= 82 else "needs_review")
+
                 if score > best["score"]:
                     best = {
-                        "status": "verified" if score >= 82 else "needs_review",
+                        "status": status,
                         "source": "crossref",
                         "score": int(score),
                         "doi": cand_doi,
@@ -875,7 +885,7 @@ def verify_reference_online(
         except Exception as e:
             best["error_crossref"] = str(e)[:220]
 
-    # ---- OpenAlex (strict gates) ----
+    # OpenAlex
     if use_openalex:
         try:
             items = openalex_search(query, per_page=10)
@@ -885,19 +895,21 @@ def verify_reference_online(
                 cand_title = openalex_title(it)
                 cand_doi = openalex_doi(it)
 
-                if who_is_org:
-                    pass
-                else:
+                if not who_is_org:
                     if ref_surname and not author_match_ok(ref_surname, cand_fam):
                         continue
+                    if ref_year and not year_match_ok(ref_year, cand_year):
+                        continue
+                else:
+                    if ref_year and not year_match_ok(ref_year, cand_year):
+                        continue
 
-                if ref_year and not year_match_ok(ref_year, cand_year):
-                    continue
+                score = fuzz.WRatio(title_snip, cand_title) if (title_snip and cand_title) else 70
+                status = "verified" if score >= 90 else ("likely" if score >= 82 else "needs_review")
 
-                score = fuzz.WRatio(title_snip, cand_title) if title_snip and cand_title else 80
                 if score > best["score"]:
                     best = {
-                        "status": "verified" if score >= 82 else "needs_review",
+                        "status": status,
                         "source": "openalex",
                         "score": int(score),
                         "doi": cand_doi,
@@ -912,7 +924,6 @@ def verify_reference_online(
             best["error_openalex"] = str(e)[:220]
 
     return best
-
 
 
 # =============================
@@ -1027,7 +1038,6 @@ if not text.strip():
     st.stop()
 
 main_text, ref_text, ref_msg = split_by_heading(text)
-
 auto_idx, auto_conf = auto_detect_references_start(text) if ref_msg == "No heading found" else (None, 1.0)
 
 st.subheader("References detection")
@@ -1047,8 +1057,6 @@ if manual:
     ref_text = "\n".join(lines[idx:]).strip()
 
 st.caption(f"Main text length: {len(main_text):,} chars | References length: {len(ref_text):,} chars")
-with st.expander("Sanity check: end of main text"):
-    st.text(main_text[-3500:] if main_text else "")
 
 with st.expander("Preview detected References section"):
     st.text(ref_text[:8000] if ref_text else "No references detected yet")
@@ -1090,15 +1098,20 @@ if missing_keys and ref_keys:
         matches = process.extract(mk, ref_keys, scorer=fuzz.WRatio, limit=5)
         suggestions[mk] = [f"{m[0]} ({int(m[1])})" for m in matches if m[1] >= 75]
 
-# User-friendly labels
-key_to_pretty_cite = {c.key: c.pretty for c in cites}
-key_to_pretty_ref = {r.key: r.pretty for r in refs}
+# Build display mappings:
+# - missing table should show the actual in-text citation text (not only first author)
+# - uncited table should show full reference entries
+key_to_display_cite = {}
+for c in cites:
+    # keep what the user actually wrote (raw), it includes the year
+    key_to_display_cite[c.key] = c.raw
+
+key_to_full_ref = {r.key: r.raw for r in refs}
 
 df_missing = pd.DataFrame([
     {
-        "citation": key_to_pretty_cite.get(k, k),
+        "citation_in_text": key_to_display_cite.get(k, k),
         "count_in_text": cite_counts[k],
-        "internal_key": k,
         "suggested_matches": ", ".join(suggestions.get(k, []))
     }
     for k in missing_keys
@@ -1106,9 +1119,8 @@ df_missing = pd.DataFrame([
 
 df_uncited = pd.DataFrame([
     {
-        "reference": key_to_pretty_ref.get(k, k),
+        "reference_full": key_to_full_ref.get(k, k),
         "times_in_references": ref_counts[k],
-        "internal_key": k
     }
     for k in uncited_keys
 ])
@@ -1202,7 +1214,6 @@ if enable_verify:
     if (use_crossref and not test_ok) and (not use_openalex):
         st.error("Online verification can’t reach Crossref from this deployment.")
         st.write(f"Error: {test_msg}")
-        st.info("On Streamlit Cloud, redeploy and avoid rapid repeated queries. Also check if your network blocks outbound requests.")
     else:
         rows = []
         progress = st.progress(0)
@@ -1216,7 +1227,7 @@ if enable_verify:
                 use_openalex=use_openalex
             )
             rows.append({
-                "reference": r.raw[:220],
+                "reference": (r.raw[:220] + "…") if len(r.raw) > 220 else r.raw,
                 "status": res.get("status", ""),
                 "source": res.get("source", ""),
                 "score": res.get("score", ""),
@@ -1269,12 +1280,3 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
-
-
-
-
-
-
-
-
-
