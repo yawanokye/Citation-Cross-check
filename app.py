@@ -16,6 +16,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
 
+# For Word export  ← ADD THIS BLOCK HERE
+try:
+    from docx import Document as DocxDocument
+except Exception:
+    DocxDocument = None
+
+# Optional readers
+try:
+    import docx
+except Exception:
+    docx = None
 # Optional readers
 try:
     import docx
@@ -581,6 +592,189 @@ def parse_reference_numeric(entry: str) -> Optional[ReferenceEntry]:
         return ReferenceEntry(entry, key_numeric(n), f"[{n}]", number=n)
 
     return None
+# =============================
+# Reference-style detection + reformat + DOCX export
+# =============================
+STYLE_APA = "APA-like"
+STYLE_HARVARD = "Harvard-like"
+STYLE_NUMERIC = "Numeric"
+
+def detect_reference_style(ref_entries: List[str]) -> Tuple[str, Dict[str, int]]:
+    """
+    Detect dominant style from raw reference entries.
+    Returns (style_name, counts).
+    """
+    counts = {STYLE_APA: 0, STYLE_HARVARD: 0, STYLE_NUMERIC: 0}
+
+    for raw in ref_entries:
+        r = raw.strip()
+        if not r:
+            continue
+
+        # numeric start: [1] ... or 1. ... or 1) ...
+        if re.match(r"^\s*(\[\d+\]|\d+[\.\)])\s+", r):
+            counts[STYLE_NUMERIC] += 1
+            continue
+
+        # APA-like: Surname, A. A. (2020). Title...
+        if re.search(rf"^[A-Z][A-Za-z\-']+\s*,.+?\(\s*{YEAR}\s*\)\.", r):
+            counts[STYLE_APA] += 1
+            continue
+
+        # Harvard-like: Surname, A. A. 2020. Title...
+        if re.search(rf"^[A-Z][A-Za-z\-']+\s*,.+?\b{YEAR}\b", r) and "(" not in r[:60]:
+            counts[STYLE_HARVARD] += 1
+            continue
+
+    dominant = max(counts.items(), key=lambda kv: kv[1])[0]
+    return dominant, counts
+
+
+def _get_first_author_and_year_from_ref(ref_raw: str) -> Tuple[str, str]:
+    """
+    Best-effort extraction for reformats when metadata is incomplete.
+    """
+    e = _strip_leading_numbering(ref_raw)
+
+    # Org or author
+    m_org = re.match(r"^\s*([A-Z][A-Za-z&.\- ]{2,}?)\s*[\.\,]?\s*\(?\s*(" + YEAR + r")\s*\)?", e)
+    if m_org:
+        who = m_org.group(1).strip()
+        y = m_org.group(2).strip()
+        return titleish(who), y
+
+    m_au = re.match(r"^\s*([A-Z][A-Za-z\-']+)\s*,.*?\(?\s*(" + YEAR + r")\s*\)?", e)
+    if m_au:
+        return titleish(m_au.group(1).strip()), m_au.group(2).strip()
+
+    # fallback: unknown
+    y = ""
+    ym = re.search(rf"\b({YEAR})\b", e)
+    if ym:
+        y = ym.group(1)
+    return "Unknown", y
+
+
+def format_reference_entry(ref_raw: str, target_style: str, idx: int = 1, enrich: bool = False) -> str:
+    """
+    Reformat ONE reference into a target style.
+    - If enrich=True and DOI exists, try Crossref for better formatting.
+    - Otherwise do best-effort minimal rewrite: ordering + year placement + numbering.
+    """
+    base = _strip_leading_numbering(ref_raw).strip()
+
+    if enrich:
+        doi = extract_doi(base)
+        if doi:
+            cr = crossref_lookup_by_doi(doi)
+            if cr:
+                # Crossref metadata
+                title = (cr.get("title") or [""])[0] if cr.get("title") else ""
+                authors = cr.get("author") or []
+                year = crossref_item_year(cr)
+                container = (cr.get("container-title") or [""])[0] if cr.get("container-title") else ""
+                volume = cr.get("volume") or ""
+                issue = cr.get("issue") or ""
+                page = cr.get("page") or ""
+                publisher = cr.get("publisher") or ""
+
+                # first author surname + initials (best-effort)
+                def _fmt_author(a: dict) -> str:
+                    fam = a.get("family") or ""
+                    giv = a.get("given") or ""
+                    initials = ""
+                    for part in giv.replace(".", " ").split():
+                        if part:
+                            initials += part[0].upper() + ". "
+                    initials = initials.strip()
+                    if fam and initials:
+                        return f"{fam}, {initials}"
+                    return fam or giv or ""
+
+                author_str = ", ".join([_fmt_author(a) for a in authors if _fmt_author(a)]) if authors else ""
+                year_str = str(year) if year else ""
+
+                if target_style == STYLE_APA:
+                    # APA-like: Author. (Year). Title. Journal, volume(issue), pages. DOI
+                    j = container
+                    vol_issue = volume
+                    if issue:
+                        vol_issue = f"{volume}({issue})" if volume else f"({issue})"
+                    tail = ", ".join([p for p in [j, vol_issue] if p]).strip()
+                    pages = page
+                    pieces = [p for p in [author_str, f"({year_str})." if year_str else "", f"{title}." if title else "", tail, pages] if p]
+                    out = " ".join(pieces).strip()
+                    if doi:
+                        out = f"{out} https://doi.org/{doi}".strip()
+                    return out
+
+                if target_style == STYLE_HARVARD:
+                    # Harvard-like: Author, Year. Title. Journal volume(issue), pages. DOI
+                    head = author_str
+                    if year_str:
+                        head = f"{head}, {year_str}."
+                    j = container
+                    vol_issue = volume
+                    if issue:
+                        vol_issue = f"{volume}({issue})" if volume else f"({issue})"
+                    mid = " ".join([p for p in [f"{title}." if title else "", j] if p]).strip()
+                    tail = " ".join([p for p in [vol_issue, (page + ".") if page else ""] if p]).strip()
+                    out = " ".join([p for p in [head, mid, tail] if p]).strip()
+                    if doi:
+                        out = f"{out} https://doi.org/{doi}".strip()
+                    return out
+
+                if target_style == STYLE_NUMERIC:
+                    # Numeric: [n] Author, "Title," Journal, vol(issue), pp. pages, Year. DOI
+                    j = container
+                    vol_issue = volume
+                    if issue:
+                        vol_issue = f"{volume}({issue})" if volume else f"({issue})"
+                    pp = f"pp. {page}" if page else ""
+                    out = f"[{idx}] {author_str}, \"{title},\" {j}, {vol_issue}, {pp}, {year_str}."
+                    if doi:
+                        out = f"{out} https://doi.org/{doi}"
+                    return norm_spaces(out)
+
+    # ---- non-enriched fallback formatting ----
+    who, y = _get_first_author_and_year_from_ref(base)
+
+    if target_style == STYLE_APA:
+        # If it already has (Year), keep base. Else convert first year to (Year)
+        if re.search(rf"\(\s*{YEAR}\s*\)", base):
+            return base
+        if y:
+            # place "(Year)." after first segment (best-effort)
+            return re.sub(rf"\b{re.escape(y)}\b", f"({y}).", base, count=1)
+
+    if target_style == STYLE_HARVARD:
+        # If it already has plain year without parentheses, keep base. Else remove parentheses
+        if re.search(rf"\(\s*{YEAR}\s*\)", base):
+            return re.sub(rf"\(\s*({YEAR})\s*\)", r"\1", base)
+        return base
+
+    if target_style == STYLE_NUMERIC:
+        # Ensure numeric prefix
+        if re.match(r"^\s*\[\d+\]", ref_raw) or re.match(r"^\s*\d+[\.\)]", ref_raw):
+            return ref_raw
+        return f"[{idx}] {base}"
+
+    return base
+
+
+def export_references_to_docx(formatted_refs: List[str], title: str = "References") -> bytes:
+    if DocxDocument is None:
+        raise RuntimeError("python-docx not available for DOCX export")
+
+    doc = DocxDocument()
+    doc.add_heading(title, level=1)
+
+    for r in formatted_refs:
+        p = doc.add_paragraph(r)
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 # =============================
@@ -1099,6 +1293,55 @@ else:
     ref_raw = split_reference_entries(ref_text)
     refs = [parse_reference_numeric(r) for r in ref_raw]
     refs = [r for r in refs if r is not None]
+st.divider()
+st.subheader("Reference style check and reformat (export to Word)")
+
+det_style, det_counts = detect_reference_style(ref_raw)
+
+st.write(
+    f"Detected dominant reference style: **{det_style}** "
+    f"(APA-like: {det_counts[STYLE_APA]}, Harvard-like: {det_counts[STYLE_HARVARD]}, Numeric: {det_counts[STYLE_NUMERIC]})"
+)
+
+target_style = st.selectbox(
+    "Reformat all reference entries into",
+    [STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC],
+    index=[STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC].index(det_style) if det_style in [STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC] else 0
+)
+
+enrich_with_doi = st.checkbox(
+    "Improve formatting using DOI metadata (Crossref lookup when DOI exists)",
+    value=False
+)
+
+if st.button("Generate reformatted References list"):
+    formatted = []
+    for i, raw in enumerate(ref_raw, start=1):
+        formatted.append(format_reference_entry(raw, target_style, idx=i, enrich=enrich_with_doi))
+
+    st.markdown("#### Preview (first 20)")
+    st.text("\n".join(formatted[:20]))
+
+    # Download as DOCX
+    if DocxDocument is None:
+        st.warning("DOCX export needs python-docx in your environment.")
+    else:
+        docx_bytes = export_references_to_docx(formatted, title="References")
+        st.download_button(
+            "Download reformatted References (DOCX)",
+            data=docx_bytes,
+            file_name=f"references_reformatted_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+
+    # Also offer TXT
+    st.download_button(
+        "Download reformatted References (TXT)",
+        data="\n".join(formatted).encode("utf-8"),
+        file_name="references_reformatted.txt",
+        mime="text/plain"
+    )
+
 
 cite_keys = [c.key for c in cites]
 ref_keys = [r.key for r in refs]
@@ -1298,5 +1541,6 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
