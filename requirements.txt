@@ -1,9 +1,11 @@
 streamlit
 pandas
+requests
+rapidfuzz
+tenacity
+reportlab
 python-docx
 pdfplumber
-rapidfuzz
-reportlab
-requests
-tenacity
+
+
 
