@@ -22,6 +22,59 @@ try:
     from docx import Document as DocxDocument
 except Exception:
     DocxDocument = None
+# =============================
+# Usage counter system
+# =============================
+import json
+import os
+
+USAGE_FILE = "usage_stats.json"
+
+
+def load_usage_stats():
+    if not os.path.exists(USAGE_FILE):
+        return {
+            "app_runs": 0,
+            "files_processed": 0,
+            "citations_checked": 0,
+            "references_checked": 0,
+        }
+    try:
+        with open(USAGE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "app_runs": 0,
+            "files_processed": 0,
+            "citations_checked": 0,
+            "references_checked": 0,
+        }
+
+
+def save_usage_stats(stats):
+    try:
+        with open(USAGE_FILE, "w") as f:
+            json.dump(stats, f, indent=2)
+    except Exception:
+        pass
+
+
+def increment_usage(app_run=False, file=False, cites=0, refs=0):
+    stats = load_usage_stats()
+
+    if app_run:
+        stats["app_runs"] += 1
+
+    if file:
+        stats["files_processed"] += 1
+
+    stats["citations_checked"] += cites
+    stats["references_checked"] += refs
+
+    save_usage_stats(stats)
+
+    return stats
+
 
 # Optional readers
 try:
@@ -1250,6 +1303,10 @@ if not text.strip():
     st.info("Upload a file or paste text to begin.")
     st.stop()
 
+# Record app run
+usage_stats = increment_usage(app_run=True)
+
+
 main_text, ref_text, ref_msg = split_by_heading(text)
 auto_idx, auto_conf = auto_detect_references_start(text) if ref_msg == "No heading found" else (None, 1.0)
 
@@ -1346,6 +1403,13 @@ if st.button("Generate reformatted References list"):
 
 cite_keys = [c.key for c in cites]
 ref_keys = [r.key for r in refs]
+# Record usage counts
+usage_stats = increment_usage(
+    file=True,
+    cites=len(cites),
+    refs=len(refs)
+)
+
 
 missing_keys = sorted(set(cite_keys) - set(ref_keys))
 uncited_keys = sorted(set(ref_keys) - set(cite_keys))
@@ -1529,6 +1593,20 @@ st.download_button(
     mime="application/pdf"
 )
 
+# =============================
+# Usage statistics display
+# =============================
+st.divider()
+st.subheader("Usage statistics")
+
+stats = load_usage_stats()
+
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric("App runs", stats["app_runs"])
+c2.metric("Files processed", stats["files_processed"])
+c3.metric("Citations checked", stats["citations_checked"])
+c4.metric("References checked", stats["references_checked"])
 
 # =============================
 # Debug
@@ -1542,6 +1620,7 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
 
