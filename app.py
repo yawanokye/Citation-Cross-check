@@ -369,9 +369,50 @@ def auto_detect_references_start(text: str) -> Tuple[int, float]:
         score = sum(ref_line_score(lines[j]) for j in range(i, i + window))
         scores.append((i, score))
 
-    if not scores:
-        idx = max(0, int(len(lines) * 0.70))
-        return idx, 0.2
+    best_idx, best_score = max(scores, key=lambda x: x[1])
+    confidence = min(1.0, best_score / window)
+
+    return best_idx, confidence
+
+
+# ==========================================================
+# ADD THIS FUNCTION RIGHT HERE (directly below)
+# ==========================================================
+
+def split_by_heading_or_autodetect(text: str) -> Tuple[str, str, str]:
+    lines = text.splitlines()
+
+    heading_idx = None
+    heading_line = ""
+
+    for i, line in enumerate(lines):
+        s = line.strip()
+        for pat in REF_HEADINGS:
+            if re.search(pat, s, flags=re.IGNORECASE):
+                heading_idx = i
+                heading_line = s
+                break
+        if heading_idx is not None:
+            break
+
+    auto_idx, auto_conf = auto_detect_references_start(text)
+
+    if heading_idx is None:
+        chosen = auto_idx
+        reason = f"No heading found, used auto-detect (confidence {auto_conf:.2f})."
+    else:
+        chosen = heading_idx + 1
+        reason = f"Found heading: {heading_line}"
+
+        if auto_conf >= 0.55 and auto_idx > heading_idx + 3:
+            chosen = auto_idx
+            reason = f"Found heading: {heading_line}, but used auto-detect later start (confidence {auto_conf:.2f}) to avoid PDF spillover."
+
+    main = "\n".join(lines[:chosen]).strip()
+    refs = "\n".join(lines[chosen:]).strip()
+
+    return main, refs, reason
+
 
     scores_sorted = sorted(scores, key=lambda x: x[1], reverse=True)
     best_i, best_s = scores_sorted[0]
@@ -1236,7 +1277,7 @@ if not text.strip():
 # Count app run (once per session)
 increment_once_per_session("counted_app_run", app_run=True)
 
-main_text, ref_text, ref_msg = split_by_heading(text)
+main_text, ref_text, ref_msg = split_by_heading_or_autodetect(text)
 auto_idx, auto_conf = auto_detect_references_start(text) if ref_msg == "No heading found" else (None, 1.0)
 
 st.subheader("References detection")
@@ -1545,3 +1586,4 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
