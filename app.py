@@ -469,13 +469,32 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
 # Numeric citation extraction
 # =============================
 def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
-    out = []
-    pat = re.compile(r"\[(\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\]")
+    out: List[InTextCitation] = []
+
+    # Match [1], [1], [1]. [1]: [1]; [1]) [1]–[3], etc
+    # We capture ONLY the inside numbers/ranges, then ignore whatever punctuation follows the closing bracket.
+    pat = re.compile(
+        r"""
+        \[
+            \s*
+            (
+                \d+(?:\s*[-–]\s*\d+)?                 # 5 or 5-7 or 5–7
+                (?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*     # , 9 or , 9-11 ...
+            )
+            \s*
+        \]
+        (?=(?:\s*[,.;:\)\]\}])|\s|$)                  # allow punctuation right after ] or end/space
+        """,
+        flags=re.VERBOSE
+    )
+
     for m in pat.finditer(text):
         raw = m.group(0)
         inside = m.group(1)
+
         chunks = [c.strip() for c in inside.split(",")]
-        nums = []
+        nums: List[int] = []
+
         for c in chunks:
             r = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", c)
             if r:
@@ -485,34 +504,12 @@ def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
             else:
                 if c.isdigit():
                     nums.append(int(c))
+
         for n in nums:
             out.append(InTextCitation("numeric", raw, key_numeric(n), f"[{n}]", number=n))
+
     return out
 
-
-def extract_vancouver_parentheses_numeric(text: str) -> List[InTextCitation]:
-    out = []
-    pat = re.compile(r"\((\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\)")
-    for m in pat.finditer(text):
-        raw = m.group(0)
-        inside = m.group(1)
-        if re.fullmatch(rf"\s*{YEAR}\s*", inside):
-            continue
-
-        chunks = [c.strip() for c in inside.split(",")]
-        nums = []
-        for c in chunks:
-            r = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", c)
-            if r:
-                a, b = int(r.group(1)), int(r.group(2))
-                if a <= b and (b - a) <= 2000:
-                    nums.extend(range(a, b + 1))
-            else:
-                if c.isdigit():
-                    nums.append(int(c))
-        for n in nums:
-            out.append(InTextCitation("numeric", raw, key_numeric(n), f"({n})", number=n))
-    return out
 
 
 # =============================
@@ -1545,3 +1542,4 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
