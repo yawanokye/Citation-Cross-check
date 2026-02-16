@@ -376,7 +376,7 @@ def auto_detect_references_start(text: str) -> Tuple[int, float]:
 
 
 # ==========================================================
-# ADD THIS FUNCTION RIGHT HERE (directly below)
+# ADD THIS FUNCTION RIGHT
 # ==========================================================
 
 def split_by_heading_or_autodetect(text: str) -> Tuple[str, str, str]:
@@ -510,13 +510,32 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
 # Numeric citation extraction
 # =============================
 def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
-    out = []
-    pat = re.compile(r"\[(\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\]")
+    """
+    IEEE numeric citations:
+      [5] [5], [5]. [5]: [5);  also ranges like [5–8] and lists like [5, 7, 9]
+    Also supports fullwidth brackets used by some PDFs: ［5］
+    """
+    out: List[InTextCitation] = []
+
+    # Support ASCII [ ] and fullwidth ［ ］
+    open_b = r"[\[\［]"
+    close_b = r"[\]\］]"
+
+    # Accept punctuation right after the closing bracket (or whitespace/end)
+    pat = re.compile(
+        rf"{open_b}"
+        rf"(\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)"
+        rf"\s*{close_b}"
+        rf"(?=[\s\.,;:\)\]\}}!?]|$)"
+    )
+
     for m in pat.finditer(text):
-        raw = m.group(0)
+        raw = m.group(0)  # raw is like [5] (without trailing punctuation)
         inside = m.group(1)
-        chunks = [c.strip() for c in inside.split(",")]
-        nums = []
+
+        chunks = [c.strip() for c in inside.split(",") if c.strip()]
+        nums: List[int] = []
+
         for c in chunks:
             r = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", c)
             if r:
@@ -526,34 +545,12 @@ def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
             else:
                 if c.isdigit():
                     nums.append(int(c))
+
         for n in nums:
             out.append(InTextCitation("numeric", raw, key_numeric(n), f"[{n}]", number=n))
+
     return out
 
-
-def extract_vancouver_parentheses_numeric(text: str) -> List[InTextCitation]:
-    out = []
-    pat = re.compile(r"\((\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\)")
-    for m in pat.finditer(text):
-        raw = m.group(0)
-        inside = m.group(1)
-        if re.fullmatch(rf"\s*{YEAR}\s*", inside):
-            continue
-
-        chunks = [c.strip() for c in inside.split(",")]
-        nums = []
-        for c in chunks:
-            r = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", c)
-            if r:
-                a, b = int(r.group(1)), int(r.group(2))
-                if a <= b and (b - a) <= 2000:
-                    nums.extend(range(a, b + 1))
-            else:
-                if c.isdigit():
-                    nums.append(int(c))
-        for n in nums:
-            out.append(InTextCitation("numeric", raw, key_numeric(n), f"({n})", number=n))
-    return out
 
 
 # =============================
@@ -1586,4 +1583,5 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
