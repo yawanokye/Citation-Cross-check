@@ -507,148 +507,139 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
 
 
 # =============================
-# Numeric citation extraction
+
 # =============================
+# vancouver extraction
+# =============================
+
+_SUP_DIGITS = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+}
+
+def _sup_to_int(s: str) -> Optional[int]:
+    try:
+        return int("".join(_SUP_DIGITS.get(ch, "") for ch in s))
+    except Exception:
+        return None
+
+
+def _expand_numeric_chunks(inside: str) -> List[int]:
+    """
+    Expands: "1, 2, 5-7" / "1–3" into [1,2,5,6,7] / [1,2,3]
+    """
+    chunks = [c.strip() for c in inside.split(",") if c.strip()]
+    nums: List[int] = []
+    for c in chunks:
+        r = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", c)
+        if r:
+            a, b = int(r.group(1)), int(r.group(2))
+            if a <= b and (b - a) <= 2000:
+                nums.extend(range(a, b + 1))
+        else:
+            if c.isdigit():
+                nums.append(int(c))
+    return nums
+
+
 def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
     """
-    IEEE numeric citations:
-      [5] [5], [5]. [5]: [5);  also ranges like [5–8] and lists like [5, 7, 9]
-    Also supports fullwidth brackets used by some PDFs: ［5］
+    IEEE in-text usually uses [1], also allow:
+    - punctuation after: [5], [5]. [5]:
+    - fullwidth brackets: ［1］
+    - ranges and lists: [1,2,5], [1–3]
     """
     out: List[InTextCitation] = []
 
-    # Support ASCII [ ] and fullwidth ［ ］
     open_b = r"[\[\［]"
     close_b = r"[\]\］]"
 
-    # Accept punctuation right after the closing bracket (or whitespace/end)
     pat = re.compile(
         rf"{open_b}"
         rf"(\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)"
         rf"\s*{close_b}"
+        # accept punctuation immediately after, or whitespace/end
         rf"(?=[\s\.,;:\)\]\}}!?]|$)"
     )
 
     for m in pat.finditer(text):
-        raw = m.group(0)  # raw is like [5] (without trailing punctuation)
+        raw = m.group(0)
         inside = m.group(1)
-
-        chunks = [c.strip() for c in inside.split(",") if c.strip()]
-        nums: List[int] = []
-
-        for c in chunks:
-            r = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", c)
-            if r:
-                a, b = int(r.group(1)), int(r.group(2))
-                if a <= b and (b - a) <= 2000:
-                    nums.extend(range(a, b + 1))
-            else:
-                if c.isdigit():
-                    nums.append(int(c))
-
-        for n in nums:
+        for n in _expand_numeric_chunks(inside):
             out.append(InTextCitation("numeric", raw, key_numeric(n), f"[{n}]", number=n))
 
     return out
 
 
+def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
+    """
+    Vancouver in-text can be:
+      (1)   [1]   ¹
+    and lists/ranges like:
+      (1,2,5) (1–3)  [1,2,5] [1–3]  ¹–³
+    Reference list is commonly:
+      1. ... 2. ... 3. ...
+    (That is handled by parse_reference_numeric, not here.)
+    """
+    out: List[InTextCitation] = []
 
-# =============================
-# Reference entry extraction
-# =============================
-def split_reference_entries(ref_text: str) -> List[str]:
-    ref_text = ref_text.strip()
-    if not ref_text:
-        return []
-
-    lines = [l.rstrip() for l in ref_text.splitlines() if l.strip()]
-    entries = []
-    buf = ""
-
-    start_pat = re.compile(
-        r"^\s*(\[\d+\]|\d+[\.\)])\s+"
-        r"|^\s*[A-Z][A-Za-z\-']+\s*,"
-        r"|^\s*[A-Z][A-Z&\- ]{2,}\."
-        r"|^\s*(World Bank|World Bank Group|UNCTAD|OECD|WHO|IMF|UNESCO|UNICEF)\b",
-        flags=re.IGNORECASE,
+    # ---- (1) style (also fullwidth parentheses) ----
+    open_p = r"[\(\（]"
+    close_p = r"[\)\）]"
+    paren_pat = re.compile(
+        rf"{open_p}"
+        rf"(\s*\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)"
+        rf"\s*{close_p}"
+        rf"(?=[\s\.,;:\)\]\}}!?]|$)"
     )
 
-    for line in lines:
-        if start_pat.search(line) and buf:
-            entries.append(buf.strip())
-            buf = line.strip()
-        else:
-            buf = (buf + " " + line.strip()).strip() if buf else line.strip()
+    for m in paren_pat.finditer(text):
+        raw = m.group(0)
+        inside = m.group(1)
 
-    if buf:
-        entries.append(buf.strip())
+        # avoid treating (2020) as Vancouver numeric
+        if re.fullmatch(rf"\s*{YEAR}\s*", inside):
+            continue
 
-    # If one big blob, try splitting by numbering again
-    if len(entries) == 1:
-        big = entries[0]
-        chunks = re.split(r"(?=(?:\s|^)(?:\[\d+\]|\d+[\.\)])\s+)", big)
-        chunks = [norm_spaces(c) for c in chunks if norm_spaces(c)]
-        if len(chunks) >= 2:
-            entries = chunks
+        for n in _expand_numeric_chunks(inside):
+            out.append(InTextCitation("numeric", raw, key_numeric(n), f"({n})", number=n))
 
-    return entries
+    # ---- [1] style (same as IEEE, some Vancouver variants use brackets) ----
+    out.extend(extract_ieee_numeric_citations(text))
 
+    # ---- superscript style (¹ ² ³) ----
+    sup_run = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+")
+    for m in sup_run.finditer(text):
+        s = m.group(0)
 
-def _strip_leading_numbering(entry: str) -> str:
-    return re.sub(r"^\s*(\[\d+\]|\d+[\.\)])\s+", "", entry).strip()
+        # simple boundary checks to reduce false positives
+        prev_ch = text[m.start() - 1] if m.start() > 0 else ""
+        next_ch = text[m.end()] if m.end() < len(text) else ""
 
+        if prev_ch and not (prev_ch.isalnum() or prev_ch in ")]}”\"'"):
+            continue
+        if next_ch and not (next_ch.isspace() or next_ch in ".,;:)]}!?"):
+            continue
 
-def parse_reference_author_year(entry: str) -> Optional[ReferenceEntry]:
-    e = _strip_leading_numbering(entry)
-    if not e:
-        return None
+        n = _sup_to_int(s)
+        if n is None:
+            continue
+        out.append(InTextCitation("numeric", s, key_numeric(n), f"{n}", number=n))
 
-    # Organisation: UNCTAD. (2025). ...
-    org_m = re.search(rf"^([A-Z][A-Z&\- ]{{2,}})\.\s*\(\s*({YEAR})\s*\)", e)
-    if org_m:
-        org, y = org_m.group(1).strip(), org_m.group(2)
-        if is_known_org(org):
-            key = key_org_year(org, y)
-            return ReferenceEntry(entry, key, f"{titleish(org)} ({y})", org, y)
+    # superscript ranges like ¹–³
+    sup_range = re.compile(r"([⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*[-–]\s*([⁰¹²³⁴⁵⁶⁷⁸⁹]+)")
+    for m in sup_range.finditer(text):
+        a = _sup_to_int(m.group(1))
+        b = _sup_to_int(m.group(2))
+        if a is None or b is None:
+            continue
+        if a <= b and (b - a) <= 2000:
+            raw = m.group(0)
+            for n in range(a, b + 1):
+                out.append(InTextCitation("numeric", raw, key_numeric(n), f"{n}", number=n))
 
-    # Organisation: World Bank (2023). ... OR World Bank. (2023). ...
-    org2 = re.search(rf"^([A-Z][A-Za-z&.\- ]{{2,}}?)\.?\s*\(\s*({YEAR})\s*\)", e)
-    if org2:
-        org, y = org2.group(1).strip(), org2.group(2)
-        if is_known_org(org) and not looks_like_two_authors(org):
-            key = key_org_year(org, y)
-            return ReferenceEntry(entry, key, f"{titleish(org)} ({y})", org, y)
+    return out
 
-    # Author-year: Surname, X. (2020). ...
-    m = re.search(rf"^([A-Z][A-Za-z\-']+)\s*,.*?\(\s*({YEAR})\s*\)", e)
-    if m:
-        au, y = m.group(1), m.group(2)
-        key = key_author_year(au, y)
-        return ReferenceEntry(entry, key, f"{titleish(au)} ({y})", au, y)
-
-    # Harvard-ish: Surname, X. ... 2020 ...
-    m2 = re.search(rf"^([A-Z][A-Za-z\-']+)\s*,.*?\b({YEAR})\b", e)
-    if m2:
-        au, y = m2.group(1), m2.group(2)
-        key = key_author_year(au, y)
-        return ReferenceEntry(entry, key, f"{titleish(au)} ({y})", au, y)
-
-    return None
-
-
-def parse_reference_numeric(entry: str) -> Optional[ReferenceEntry]:
-    e = entry.strip()
-    m = re.match(r"^\s*\[(\d+)\]\s*(.+)$", e)
-    if m:
-        n = int(m.group(1))
-        return ReferenceEntry(entry, key_numeric(n), f"[{n}]", number=n)
-
-    m = re.match(r"^\s*(\d+)[\.\)]\s+(.+)$", e)
-    if m:
-        n = int(m.group(1))
-        return ReferenceEntry(entry, key_numeric(n), f"[{n}]", number=n)
-
-    return None
 
 
 # =============================
@@ -1249,8 +1240,9 @@ with col2:
 
 style = st.selectbox(
     "Citation style to check",
-    ["APA/Harvard (author–year)", "IEEE (numeric [1])", "Vancouver (numeric (1))"],
+    ["APA/Harvard (author–year)", "IEEE (numeric [1])", "Vancouver (numeric 1)"],
 )
+
 
 text = ""
 if uploaded is not None:
@@ -1314,10 +1306,11 @@ elif style.startswith("IEEE"):
     refs = [parse_reference_numeric(r) for r in ref_raw]
     refs = [r for r in refs if r is not None]
 else:
-    cites = extract_vancouver_parentheses_numeric(main_text)
+    cites = extract_vancouver_numeric_citations(main_text)
     ref_raw = split_reference_entries(ref_text)
     refs = [parse_reference_numeric(r) for r in ref_raw]
     refs = [r for r in refs if r is not None]
+
 
 # Count file processing once per session (prevents rerun inflation)
 increment_once_per_session(
@@ -1583,5 +1576,6 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
