@@ -104,7 +104,8 @@ REF_HEADINGS = [
     r"^\s*literature\s+cited\s*[:|]?\s*$",
 ]
 
-ORG_ALIASES = {
+# Expand org aliases as you requested (WHO/World Health Organisation, UN/United Nations, AU, EU, etc.)
+ORG_ALIASES: Dict[str, List[str]] = {
     "unctad": ["unctad", "united nations conference on trade and development"],
     "who": ["who", "world health organization", "world health organisation"],
     "oecd": [
@@ -115,9 +116,11 @@ ORG_ALIASES = {
     "world bank": ["world bank", "international bank for reconstruction and development", "ibrd"],
     "world bank group": ["world bank group"],
     "imf": ["imf", "international monetary fund"],
-    "un": ["un", "united nations"],
-    "unesco": ["unesco"],
-    "unicef": ["unicef"],
+    "un": ["un", "united nations", "u.n.", "united nations organisation", "united nations organization"],
+    "au": ["au", "african union"],
+    "eu": ["eu", "european union"],
+    "unesco": ["unesco", "united nations educational, scientific and cultural organization", "united nations educational scientific and cultural organization"],
+    "unicef": ["unicef", "united nations children's fund", "united nations childrens fund"],
 }
 
 ORG_ACRONYMS = {
@@ -126,6 +129,8 @@ ORG_ACRONYMS = {
     "OECD",
     "IMF",
     "UN",
+    "AU",
+    "EU",
     "UNESCO",
     "UNICEF",
     "WORLD BANK",
@@ -144,16 +149,20 @@ NONNAME_STOPWORDS = {
     "public", "construct", "africa", "europe", "america", "world", "bank",
 }
 
+STYLE_APA = "APA-like"
+STYLE_HARVARD = "Harvard-like"
+STYLE_NUMERIC = "Numeric"
+
 
 # =============================
 # Data classes
 # =============================
 @dataclass
 class InTextCitation:
-    style: str                  # author-year | org-year | numeric
-    raw: str                    # exact matched string from text (best for display)
-    key: str                    # internal matching key
-    pretty: str                 # display label
+    style: str
+    raw: str
+    key: str
+    pretty: str
     author_or_org: Optional[str] = None
     year: Optional[str] = None
     number: Optional[int] = None
@@ -161,9 +170,9 @@ class InTextCitation:
 
 @dataclass
 class ReferenceEntry:
-    raw: str                    # full reference entry (keep full for display)
-    key: str                    # internal matching key
-    pretty: str                 # short label
+    raw: str
+    key: str
+    pretty: str
     author_or_org: Optional[str] = None
     year: Optional[str] = None
     number: Optional[int] = None
@@ -177,7 +186,7 @@ def norm_spaces(s: str) -> str:
 
 
 def norm_token(s: str) -> str:
-    s = s.lower().replace("’", "'")
+    s = (s or "").lower().replace("’", "'")
     s = re.sub(r"[^a-z0-9\- ']", "", s)
     return norm_spaces(s)
 
@@ -201,19 +210,19 @@ def canon_org(name: str) -> str:
 
 
 def key_author_year(author_surname: str, year: str) -> str:
-    return f"au_{norm_token(author_surname)}_{year.lower()}"
+    return f"au_{norm_token(author_surname)}_{(year or '').lower()}"
 
 
 def key_org_year(org: str, year: str) -> str:
-    return f"org_{canon_org(org)}_{year.lower()}"
+    return f"org_{canon_org(org)}_{(year or '').lower()}"
 
 
 def key_numeric(n: int) -> str:
-    return f"n_{n}"
+    return f"n_{int(n)}"
 
 
 def is_known_org(text: str) -> bool:
-    t = text.strip()
+    t = (text or "").strip()
     if t.upper() in ORG_ACRONYMS:
         return True
     c = canon_org(t)
@@ -221,7 +230,7 @@ def is_known_org(text: str) -> bool:
 
 
 def looks_like_two_authors(name: str) -> bool:
-    parts = name.strip().split()
+    parts = (name or "").strip().split()
     return len(parts) == 2 and all(p[:1].isupper() for p in parts)
 
 
@@ -230,7 +239,6 @@ def looks_like_person_surname(token: str) -> bool:
         return False
     t = token.strip()
 
-    # reject possessive like Adam's / Adam’s
     if re.search(r"(?:'s|’s)$", t, flags=re.IGNORECASE):
         return False
 
@@ -266,16 +274,6 @@ def format_author_blob_for_display(authors_blob: str) -> str:
     s = re.sub(r"\s*,\s*", ", ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
-
-def _strip_leading_numbering(s: str) -> str:
-    """
-    Removes leading reference numbering commonly seen in Vancouver/IEEE:
-      1.  ...   1) ...  [1] ...  (1) ...  1 ... (space)
-    """
-    if not s:
-        return ""
-    return re.sub(r"^\s*(?:\[\s*\d{1,4}\s*\]|\(\s*\d{1,4}\s*\)|\d{1,4})\s*(?:[.)]\s+|\s+)", "", s).strip()
 
 
 # =============================
@@ -329,23 +327,21 @@ def read_pdf(file) -> str:
 # Reference section detection
 # =============================
 def ref_line_score(line: str) -> int:
-    s = line.strip()
+    s = (line or "").strip()
     if not s:
         return 0
 
-    # numeric list lines: 1. / 1) / [1]
+    # numeric reference list: [1] ... or 1. ... or 1) ...
     if re.match(r"^\s*(\[\d+\]|\d+[\.\)])\s+", s):
         return 5
 
-    # APA-ish
+    # author-year list shapes
     if re.match(rf"^[A-Z][A-Za-z\-']+\s*,.*\(\s*{YEAR}\s*\)", s):
         return 6
-
-    # Harvard-ish
     if re.match(rf"^[A-Z][A-Za-z\-']+\s*,.*\b{YEAR}\b", s):
         return 4
 
-    # Org-year-ish
+    # org-year list shapes
     if re.match(rf"^[A-Z][A-Z&\- ]{{2,}}\.\s*\(\s*{YEAR}\s*\)", s):
         return 6
     if re.match(rf"^[A-Z][A-Za-z&.\- ]{{2,}}?\s*\(\s*{YEAR}\s*\)", s):
@@ -355,41 +351,30 @@ def ref_line_score(line: str) -> int:
 
 
 def auto_detect_references_start(text: str) -> Tuple[int, float]:
-    lines = text.splitlines()
+    lines = (text or "").splitlines()
     if len(lines) < 40:
         idx = max(0, int(len(lines) * 0.70))
         return idx, 0.2
 
     window = 40
     start = int(len(lines) * 0.35)
-    scores = []
+    scores: List[Tuple[int, int]] = []
     for i in range(start, max(start + 1, len(lines) - window)):
         score = sum(ref_line_score(lines[j]) for j in range(i, i + window))
         scores.append((i, score))
 
-    if not scores:
-        return max(0, int(len(lines) * 0.70)), 0.0
-
-    scores_sorted = sorted(scores, key=lambda x: x[1], reverse=True)
-    best_i, best_s = scores_sorted[0]
-    second_s = scores_sorted[1][1] if len(scores_sorted) > 1 else 0
-
-    if best_s <= 0:
-        return best_i, 0.0
-
-    margin = best_s - second_s
-    conf = max(0.0, min(1.0, (best_s / (best_s + 25)) + (margin / (best_s + 1)) * 0.35))
-    return best_i, conf
+    best_idx, best_score = max(scores, key=lambda x: x[1])
+    confidence = min(1.0, best_score / window)
+    return best_idx, confidence
 
 
 def split_by_heading_or_autodetect(text: str) -> Tuple[str, str, str]:
-    lines = text.splitlines()
+    lines = (text or "").splitlines()
 
     heading_idx = None
     heading_line = ""
-
     for i, line in enumerate(lines):
-        s = line.strip()
+        s = (line or "").strip()
         for pat in REF_HEADINGS:
             if re.search(pat, s, flags=re.IGNORECASE):
                 heading_idx = i
@@ -407,15 +392,138 @@ def split_by_heading_or_autodetect(text: str) -> Tuple[str, str, str]:
         chosen = heading_idx + 1
         reason = f"Found heading: {heading_line}"
 
-        # If PDF spillover makes heading too early, switch to later auto-detected index
+        # prefer later auto start if it looks safer (PDF spillover)
         if auto_conf >= 0.55 and auto_idx > heading_idx + 3:
             chosen = auto_idx
             reason = f"Found heading: {heading_line}, but used auto-detect later start (confidence {auto_conf:.2f}) to avoid PDF spillover."
 
     main = "\n".join(lines[:chosen]).strip()
     refs = "\n".join(lines[chosen:]).strip()
-
     return main, refs, reason
+
+
+# =============================
+# Reference splitting and parsing
+# =============================
+def _strip_leading_numbering(s: str) -> str:
+    x = (s or "").strip()
+    # [12] ...
+    x = re.sub(r"^\s*\[\s*\d+\s*\]\s*", "", x)
+    # 12. ... or 12) ...
+    x = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", x)
+    return x.strip()
+
+
+def split_reference_entries(ref_text: str) -> List[str]:
+    """
+    Robust splitter for reference lists where entries may start with:
+      1.  / 1) / [1]
+    and may be on multiple lines.
+    """
+    t = (ref_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in t.split("\n")]
+
+    start_pat = re.compile(r"^\s*(?:\[\s*\d+\s*\]|\d+\s*[\.\)])\s+")
+    entries: List[str] = []
+    buf: List[str] = []
+
+    def flush():
+        nonlocal buf
+        if buf:
+            e = norm_spaces(" ".join(buf)).strip()
+            if e:
+                entries.append(e)
+        buf = []
+
+    for ln in lines:
+        if not ln.strip():
+            continue
+        if start_pat.match(ln):
+            flush()
+            buf.append(ln.strip())
+        else:
+            # continuation line
+            buf.append(ln.strip())
+
+    flush()
+
+    # If numbering not present, fall back: split by blank-line style (already removed blanks),
+    # or return single block.
+    if not entries:
+        big = norm_spaces(ref_text)
+        return [big] if big else []
+
+    return entries
+
+
+def parse_reference_numeric(ref_raw: str) -> Optional[ReferenceEntry]:
+    """
+    Accept:
+      [1] ...
+      1. ...
+      1) ...
+      1 ...
+    (the last one is common in some PDFs where punctuation is lost)
+    """
+    r = (ref_raw or "").strip()
+    if not r:
+        return None
+
+    m = re.match(r"^\s*\[\s*(\d+)\s*\]\s*(.+)$", r)
+    if m:
+        n = int(m.group(1))
+        body = m.group(2).strip()
+        return ReferenceEntry(raw=r, key=key_numeric(n), pretty=f"[{n}]", number=n, author_or_org="", year="")
+
+    m = re.match(r"^\s*(\d+)\s*[\.\)]\s*(.+)$", r)
+    if m:
+        n = int(m.group(1))
+        body = m.group(2).strip()
+        return ReferenceEntry(raw=r, key=key_numeric(n), pretty=str(n), number=n, author_or_org="", year="")
+
+    # loose: "1 Adam and Kofi ..."
+    m = re.match(r"^\s*(\d+)\s+(.+)$", r)
+    if m:
+        n = int(m.group(1))
+        return ReferenceEntry(raw=r, key=key_numeric(n), pretty=str(n), number=n, author_or_org="", year="")
+
+    return None
+
+
+def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
+    """
+    Minimal parsing so cross-check works.
+    Supports:
+      Surname, ... (2020).
+      Surname, ... 2020.
+      WHO (2020) / World Health Organisation (2020) / UN (2020) etc.
+    """
+    r = (ref_raw or "").strip()
+    if not r:
+        return None
+
+    base = _strip_leading_numbering(r)
+
+    # org first
+    m_org = re.match(rf"^\s*([A-Z][A-Za-z&.\- ]{{2,}}?)\s*[\.\,]?\s*\(?\s*({YEAR})\s*\)?", base)
+    if m_org:
+        org = m_org.group(1).strip()
+        y = m_org.group(2).strip()
+        if is_known_org(org) and not looks_like_two_authors(org):
+            k = key_org_year(org, y)
+            return ReferenceEntry(raw=r, key=k, pretty=f"{titleish(org)} {y}", author_or_org=org, year=y)
+
+    # author first
+    m_au = re.match(rf"^\s*([A-Z][A-Za-z\-']+)\s*,.*?\b({YEAR})\b", base)
+    if m_au:
+        au = m_au.group(1).strip()
+        y = m_au.group(2).strip()
+        if looks_like_person_surname(au):
+            k = key_author_year(au, y)
+            return ReferenceEntry(raw=r, key=k, pretty=f"{titleish(au)} {y}", author_or_org=au, year=y)
+
+    # fallback: try to find any year, but key will be weak (avoid false matches)
+    return None
 
 
 # =============================
@@ -440,7 +548,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         flags=re.VERBOSE,
     )
 
-    for m in narr_people.finditer(text):
+    for m in narr_people.finditer(text or ""):
         authors_blob = m.group("authors").strip()
         y = m.group("year")
 
@@ -456,7 +564,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         out.append(InTextCitation("author-year", m.group(0), key, pretty, first, y))
 
     narr_org = re.compile(rf"\b([A-Z][A-Za-z&.\- ]{{2,}}?)\s*\(\s*({YEAR})\s*\)")
-    for m in narr_org.finditer(text):
+    for m in narr_org.finditer(text or ""):
         org, y = m.group(1).strip(), m.group(2)
         if looks_like_two_authors(org):
             continue
@@ -466,7 +574,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             out.append(InTextCitation("org-year", m.group(0), key, pretty, org, y))
 
     paren_block = re.compile(rf"\(([^()]*?\b{YEAR}\b[^()]*)\)")
-    for m in paren_block.finditer(text):
+    for m in paren_block.finditer(text or ""):
         block = m.group(1)
         parts = [p.strip() for p in block.split(";") if p.strip()]
         for p in parts:
@@ -496,7 +604,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
 
 
 # =============================
-# Numeric (IEEE + Vancouver)
+# Vancouver / IEEE numeric extraction
 # =============================
 _SUP_DIGITS = {
     "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
@@ -506,14 +614,13 @@ _SUP_DIGITS = {
 
 def _sup_to_int(s: str) -> Optional[int]:
     try:
-        digits = "".join(_SUP_DIGITS.get(ch, "") for ch in s)
-        return int(digits) if digits else None
+        return int("".join(_SUP_DIGITS.get(ch, "") for ch in s))
     except Exception:
         return None
 
 
 def _expand_numeric_chunks(inside: str) -> List[int]:
-    chunks = [c.strip() for c in inside.split(",") if c.strip()]
+    chunks = [c.strip() for c in (inside or "").split(",") if c.strip()]
     nums: List[int] = []
     for c in chunks:
         r = re.match(r"^(\d+)\s*[-–]\s*(\d+)$", c)
@@ -529,6 +636,7 @@ def _expand_numeric_chunks(inside: str) -> List[int]:
 
 def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
     out: List[InTextCitation] = []
+
     open_b = r"[\[\［]"
     close_b = r"[\]\］]"
 
@@ -539,7 +647,7 @@ def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
         rf"(?=[\s\.,;:\)\]\}}!?]|$)"
     )
 
-    for m in pat.finditer(text):
+    for m in pat.finditer(text or ""):
         raw = m.group(0)
         inside = m.group(1)
         for n in _expand_numeric_chunks(inside):
@@ -548,16 +656,22 @@ def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
     return out
 
 
-def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
+def extract_vancouver_numeric_citations(
+    text: str,
+    allow_plain_clusters: bool = True,
+    strict_plain_clusters: bool = False,
+) -> List[InTextCitation]:
     """
     Vancouver in-text can be:
       (1)   [1]   ¹
-    also lists/ranges:
+    and lists/ranges like:
       (1,2,5) (1–3)  [1,2,5] [1–3]  ¹–³
+    Plus: plain clusters from PDFs where superscripts become normal digits:
+      ...text1,2,3   ...text1 2 3   ...text1-3
     """
     out: List[InTextCitation] = []
 
-    # (1) style
+    # ---- (1) style ----
     open_p = r"[\(\（]"
     close_p = r"[\)\）]"
     paren_pat = re.compile(
@@ -567,7 +681,7 @@ def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
         rf"(?=[\s\.,;:\)\]\}}!?]|$)"
     )
 
-    for m in paren_pat.finditer(text):
+    for m in paren_pat.finditer(text or ""):
         raw = m.group(0)
         inside = m.group(1)
 
@@ -578,21 +692,19 @@ def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
         for n in _expand_numeric_chunks(inside):
             out.append(InTextCitation("numeric", raw, key_numeric(n), f"({n})", number=n))
 
-    # [1] style
+    # ---- [1] style ----
     out.extend(extract_ieee_numeric_citations(text))
 
-    # superscript single or run
+    # ---- superscript runs ----
     sup_run = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+")
-    for m in sup_run.finditer(text):
+    for m in sup_run.finditer(text or ""):
         s = m.group(0)
 
-        prev_ch = text[m.start() - 1] if m.start() > 0 else ""
-        next_ch = text[m.end()] if m.end() < len(text) else ""
+        prev_ch = (text[m.start() - 1] if m.start() > 0 else "")
+        next_ch = (text[m.end()] if m.end() < len(text) else "")
 
-        # keep it conservative
-        if prev_ch and prev_ch.isdigit():
-            continue
-        if next_ch and next_ch.isalpha():
+        # keep this permissive: superscripts often stick to the end of a word
+        if next_ch and not (next_ch.isspace() or next_ch in ".,;:)]}!?"):
             continue
 
         n = _sup_to_int(s)
@@ -602,7 +714,7 @@ def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
 
     # superscript ranges like ¹–³
     sup_range = re.compile(r"([⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*[-–]\s*([⁰¹²³⁴⁵⁶⁷⁸⁹]+)")
-    for m in sup_range.finditer(text):
+    for m in sup_range.finditer(text or ""):
         a = _sup_to_int(m.group(1))
         b = _sup_to_int(m.group(2))
         if a is None or b is None:
@@ -612,134 +724,68 @@ def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
             for n in range(a, b + 1):
                 out.append(InTextCitation("numeric", raw, key_numeric(n), f"{n}", number=n))
 
-    return out
-
-
-# =============================
-# Reference splitting and parsing
-# =============================
-def split_reference_entries(ref_text: str) -> List[str]:
-    """
-    Robust splitter for references section.
-    Handles:
-      1. ...
-      2) ...
-      [1] ...
-      (1) ...
-    across multiple lines per entry.
-    """
-    if not ref_text:
-        return []
-
-    text = ref_text.strip()
-    if not text:
-        return []
-
-    # Normalize weird whitespace
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # If it already looks like line-separated simple references, still use regex chunking
-    pat = re.compile(
-        r"""
-        (?ms)
-        ^\s*
-        (?:\[\s*(?P<n1>\d{1,4})\s*\]|\(\s*(?P<n2>\d{1,4})\s*\)|(?P<n3>\d{1,4}))
-        \s*
-        (?:[.)]\s+|\s+)
-        (?P<body>.*?)
-        (?=
-            ^\s*(?:\[\s*\d{1,4}\s*\]|\(\s*\d{1,4}\s*\)|\d{1,4})\s*(?:[.)]\s+|\s+)
-            |
-            \Z
+    # ---------- NEW: plain digit clusters (lost superscript formatting) ----------
+    if allow_plain_clusters:
+        plain_cluster_pat = re.compile(
+            r"""
+            (?x)
+            (?P<prefix>[A-Za-z\)\]\}”"'])          # attach point
+            (?P<cluster>
+                \d{1,4}
+                (?:\s*[-–]\s*\d{1,4}
+                 |\s*,\s*\d{1,4}
+                 |\s+\d{1,4}
+                )+
+                |
+                \d{1,4}\s*[-–]\s*\d{1,4}
+            )
+            (?=[\s\.,;:\)\]\}!?]|$)
+            """,
+            re.VERBOSE,
         )
-        """,
-        re.VERBOSE,
-    )
 
-    matches = list(pat.finditer(text))
-    if matches:
-        entries = []
-        for m in matches:
-            n = m.group("n1") or m.group("n2") or m.group("n3") or ""
-            body = norm_spaces(m.group("body") or "")
-            if n and body:
-                entries.append(f"{n}. {body}")
-        return entries
+        def _parse_plain_cluster(cluster: str) -> List[int]:
+            c = (cluster or "").strip().replace("–", "-")
+            c = re.sub(r"\s+", " ", c).strip()
 
-    # Fallback: split by blank lines
-    rough = [norm_spaces(x) for x in re.split(r"\n\s*\n+", text) if norm_spaces(x)]
-    return rough
+            # strict mode: do NOT accept "1 2 3"
+            if strict_plain_clusters and re.search(r"\d\s+\d", c) and "," not in c and "-" not in c:
+                return []
 
+            # normalize "1 2 3" into commas if not strict
+            if " " in c and "," not in c and "-" not in c:
+                c = ",".join([x for x in c.split(" ") if x.strip()])
 
-def parse_reference_numeric(raw: str) -> Optional[ReferenceEntry]:
-    """
-    Extracts the leading numeric index (1..N) from a reference entry.
-    This is the key for Vancouver/IEEE matching, regardless of whether
-    in-text uses (1), [1], or superscript.
-    """
-    if not raw:
-        return None
-    s = raw.strip()
+            c = c.replace(" ,", ",").replace(", ", ",")
 
-    m = re.match(r"^\s*(?:\[\s*(\d{1,4})\s*\]|\(\s*(\d{1,4})\s*\)|(\d{1,4}))\s*(?:[.)]\s+|\s+)", s)
-    if not m:
-        # attempt: maybe our splitter already converted to "n. body"
-        m2 = re.match(r"^\s*(\d{1,4})\.\s+", s)
-        if not m2:
-            return None
-        n = int(m2.group(1))
-    else:
-        n_str = m.group(1) or m.group(2) or m.group(3)
-        if not n_str:
-            return None
-        n = int(n_str)
+            if "," in c:
+                return _expand_numeric_chunks(c)
 
-    key = key_numeric(n)
-    pretty = f"{n}"
-    return ReferenceEntry(raw=s, key=key, pretty=pretty, number=n)
+            m = re.match(r"^(\d+)\s*-\s*(\d+)$", c)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                if a <= b and (b - a) <= 2000:
+                    return list(range(a, b + 1))
 
+            if c.isdigit():
+                return [int(c)]
+            return []
 
-def parse_reference_author_year(raw: str) -> Optional[ReferenceEntry]:
-    """
-    For APA/Harvard reference lists:
-    Creates key based on first author/org + year.
-    """
-    if not raw:
-        return None
-    s = raw.strip()
-    if not s:
-        return None
+        for m in plain_cluster_pat.finditer(text or ""):
+            raw_cluster = m.group("cluster")
 
-    s2 = _strip_leading_numbering(s)
+            # avoid years and decimals
+            if re.search(r"\b(19|20)\d{2}\b", raw_cluster):
+                continue
+            if re.search(r"\d\.\d", raw_cluster):
+                continue
 
-    # Org
-    m_org = re.match(r"^\s*([A-Z][A-Za-z&.\- ]{2,}?)\s*[\.\,]?\s*\(?\s*(" + YEAR + r")\s*\)?", s2)
-    if m_org:
-        org = m_org.group(1).strip()
-        y = m_org.group(2).strip()
-        if is_known_org(org) and not looks_like_two_authors(org):
-            key = key_org_year(org, y)
-            pretty = f"{titleish(org)} {y}"
-            return ReferenceEntry(raw=s, key=key, pretty=pretty, author_or_org=org, year=y)
+            nums = _parse_plain_cluster(raw_cluster)
+            for n in nums:
+                if 1 <= n <= 5000:
+                    out.append(InTextCitation("numeric", raw_cluster, key_numeric(n), f"{n}", number=n))
 
-    # Author
-    m_au = re.match(r"^\s*([A-Z][A-Za-z\-']+)\s*,.*?\b(" + YEAR + r")\b", s2)
-    if m_au:
-        au = m_au.group(1).strip()
-        y = m_au.group(2).strip()
-        if looks_like_person_surname(au):
-            key = key_author_year(au, y)
-            pretty = f"{titleish(au)} {y}"
-            return ReferenceEntry(raw=s, key=key, pretty=pretty, author_or_org=au, year=y)
-
-    # fallback: find year and unknown author
-    ym = re.search(rf"\b({YEAR})\b", s2)
-    if ym:
-        y = ym.group(1)
-        key = f"unk_{y.lower()}"
-        return ReferenceEntry(raw=s, key=key, pretty=f"Unknown {y}", year=y)
-
-    return None
+    return out
 
 
 # =============================
@@ -1084,20 +1130,15 @@ def verify_reference_online(
 # =============================
 # Reference-style detection + reformat + DOCX export
 # =============================
-STYLE_APA = "APA-like"
-STYLE_HARVARD = "Harvard-like"
-STYLE_NUMERIC = "Numeric"
-
-
 def detect_reference_style(ref_entries: List[str]) -> Tuple[str, Dict[str, int]]:
     counts = {STYLE_APA: 0, STYLE_HARVARD: 0, STYLE_NUMERIC: 0}
 
-    for raw in ref_entries:
-        r = raw.strip()
+    for raw in ref_entries or []:
+        r = (raw or "").strip()
         if not r:
             continue
 
-        if re.match(r"^\s*(\[\d+\]|\d+[\.\)])\s+", r):
+        if re.match(r"^\s*(\[\d+\]|\d+[\.\)])\s+", r) or re.match(r"^\s*\d+\s+[A-Z]", r):
             counts[STYLE_NUMERIC] += 1
             continue
 
@@ -1136,66 +1177,6 @@ def _get_first_author_and_year_from_ref(ref_raw: str) -> Tuple[str, str]:
 def format_reference_entry(ref_raw: str, target_style: str, idx: int = 1, enrich: bool = False) -> str:
     base = _strip_leading_numbering(ref_raw).strip()
 
-    if enrich:
-        doi = extract_doi(base)
-        if doi:
-            cr = crossref_lookup_by_doi(doi)
-            if cr:
-                title = (cr.get("title") or [""])[0] if cr.get("title") else ""
-                authors = cr.get("author") or []
-                year = crossref_item_year(cr)
-                container = (cr.get("container-title") or [""])[0] if cr.get("container-title") else ""
-                volume = cr.get("volume") or ""
-                issue = cr.get("issue") or ""
-                page = cr.get("page") or ""
-
-                def _fmt_author(a: dict) -> str:
-                    fam = a.get("family") or ""
-                    giv = a.get("given") or ""
-                    initials = ""
-                    for part in giv.replace(".", " ").split():
-                        if part:
-                            initials += part[0].upper() + ". "
-                    initials = initials.strip()
-                    if fam and initials:
-                        return f"{fam}, {initials}"
-                    return fam or giv or ""
-
-                author_str = ", ".join([_fmt_author(a) for a in authors if _fmt_author(a)]) if authors else ""
-                year_str = str(year) if year else ""
-
-                if target_style == STYLE_APA:
-                    vol_issue = volume
-                    if issue:
-                        vol_issue = f"{volume}({issue})" if volume else f"({issue})"
-                    tail = ", ".join([p for p in [container, vol_issue] if p]).strip()
-                    pieces = [p for p in [author_str, f"({year_str})." if year_str else "", f"{title}." if title else "", tail, page] if p]
-                    out = " ".join(pieces).strip()
-                    out = f"{out} https://doi.org/{doi}".strip()
-                    return out
-
-                if target_style == STYLE_HARVARD:
-                    head = author_str
-                    if year_str:
-                        head = f"{head}, {year_str}."
-                    vol_issue = volume
-                    if issue:
-                        vol_issue = f"{volume}({issue})" if volume else f"({issue})"
-                    mid = " ".join([p for p in [f"{title}." if title else "", container] if p]).strip()
-                    tail = " ".join([p for p in [vol_issue, (page + ".") if page else ""] if p]).strip()
-                    out = " ".join([p for p in [head, mid, tail] if p]).strip()
-                    out = f"{out} https://doi.org/{doi}".strip()
-                    return out
-
-                if target_style == STYLE_NUMERIC:
-                    vol_issue = volume
-                    if issue:
-                        vol_issue = f"{volume}({issue})" if volume else f"({issue})"
-                    pp = f"pp. {page}" if page else ""
-                    out = f"{idx}. {author_str}. {title}. {container}. {vol_issue}. {pp}. {year_str}."
-                    out = f"{out} https://doi.org/{doi}".strip()
-                    return norm_spaces(out)
-
     if target_style == STYLE_APA:
         if re.search(rf"\(\s*{YEAR}\s*\)", base):
             return base
@@ -1210,8 +1191,9 @@ def format_reference_entry(ref_raw: str, target_style: str, idx: int = 1, enrich
         return base
 
     if target_style == STYLE_NUMERIC:
-        # Vancouver/IEEE reference list is typically: 1. ... 2. ...
-        return f"{idx}. {base}"
+        if re.match(r"^\s*\[\d+\]", ref_raw) or re.match(r"^\s*\d+[\.\)]", ref_raw) or re.match(r"^\s*\d+\s+", ref_raw):
+            return ref_raw
+        return f"[{idx}] {base}"
 
     return base
 
@@ -1334,8 +1316,23 @@ with col2:
 
 style = st.selectbox(
     "Citation style to check",
-    ["APA/Harvard (author–year)", "IEEE (numeric [1])", "Vancouver (numeric (1)/[1]/¹, references 1. 2. 3.)"],
+    ["APA/Harvard (author–year)", "IEEE (numeric [1])", "Vancouver (numeric 1)"],
 )
+
+# Vancouver options (covers (1) vs [1] vs superscript, and plain 1,2,3 / 1 2 3 / 1-3)
+v_allow_plain = True
+v_strict_plain = False
+if style.startswith("Vancouver"):
+    st.caption("Vancouver in-text can be (1), [1], superscripts, or plain digits from PDF extraction.")
+    v_allow_plain = st.checkbox(
+        "Capture plain numeric clusters like 1,2,3 or 1-3 (useful when superscripts are lost)",
+        value=True,
+    )
+    v_strict_plain = st.checkbox(
+        "Strict mode (ignore space-separated lists like 1 2 3)",
+        value=False,
+        disabled=not v_allow_plain,
+    )
 
 text = ""
 if uploaded is not None:
@@ -1359,10 +1356,11 @@ if not text.strip():
 increment_once_per_session("counted_app_run", app_run=True)
 
 main_text, ref_text, ref_msg = split_by_heading_or_autodetect(text)
-auto_idx, auto_conf = auto_detect_references_start(text)
 
 st.subheader("References detection")
 st.write(ref_msg)
+
+auto_idx, auto_conf = auto_detect_references_start(text)
 
 force_manual = ("No heading found" in ref_msg) and (auto_conf < 0.60)
 manual = st.checkbox(
@@ -1387,19 +1385,22 @@ if not ref_text.strip():
     ref_text = st.text_area("Paste References section here", height=240)
 
 # Extract citations and references
+ref_raw = split_reference_entries(ref_text)
+
 if style.startswith("APA/Harvard"):
     cites = extract_author_year_citations(main_text)
-    ref_raw = split_reference_entries(ref_text)
     refs = [parse_reference_author_year(r) for r in ref_raw]
     refs = [r for r in refs if r is not None]
 elif style.startswith("IEEE"):
     cites = extract_ieee_numeric_citations(main_text)
-    ref_raw = split_reference_entries(ref_text)
     refs = [parse_reference_numeric(r) for r in ref_raw]
     refs = [r for r in refs if r is not None]
 else:
-    cites = extract_vancouver_numeric_citations(main_text)
-    ref_raw = split_reference_entries(ref_text)
+    cites = extract_vancouver_numeric_citations(
+        main_text,
+        allow_plain_clusters=v_allow_plain,
+        strict_plain_clusters=v_strict_plain,
+    )
     refs = [parse_reference_numeric(r) for r in ref_raw]
     refs = [r for r in refs if r is not None]
 
@@ -1423,7 +1424,9 @@ st.write(
 target_style = st.selectbox(
     "Reformat all reference entries into",
     [STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC],
-    index=[STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC].index(det_style) if det_style in [STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC] else 0,
+    index=[STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC].index(det_style)
+    if det_style in [STYLE_APA, STYLE_HARVARD, STYLE_NUMERIC]
+    else 0,
 )
 
 enrich_with_doi = st.checkbox(
@@ -1471,7 +1474,7 @@ if missing_keys and ref_keys:
         matches = process.extract(mk, ref_keys, scorer=fuzz.WRatio, limit=5)
         suggestions[mk] = [f"{m[0]} ({int(m[1])})" for m in matches if m[1] >= 75]
 
-key_to_display_cite = {c.key: c.pretty for c in cites}
+key_to_display_cite = {c.key: c.raw for c in cites}
 key_to_full_ref = {r.key: r.raw for r in refs}
 
 df_missing = pd.DataFrame(
