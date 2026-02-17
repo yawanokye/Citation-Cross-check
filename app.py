@@ -515,7 +515,8 @@ def split_reference_entries(ref_text: str) -> List[str]:
         big = norm_spaces(ref_text)
         return [big] if big else []
     return entries
-    def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
+
+def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
 
     r = (ref_raw or "").strip()
     if not r:
@@ -1837,6 +1838,7 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
 
