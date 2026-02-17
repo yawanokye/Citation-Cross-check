@@ -1,5 +1,5 @@
 # app.py
-# Citation Crosschecker (APA/Harvard + IEEE + Vancouver)
+# Citation Crosschecker (APA/Harvard + IEEE + Vancouver) + Online verification (Crossref + OpenAlex)
 # Key fixes:
 # 1) Narrative multi-author citations no longer generate extra single-author hits inside them
 #    (so "Krejcie and Morgan (1970)" will NOT also create "Morgan (1970)").
@@ -7,9 +7,11 @@
 # 3) Missing/Uncited tables show FULL raw in-text citations and full reference entries.
 # 4) IEEE numeric supported: [1], [1-3], [1,2,5]
 # 5) Reconciliation tables: in-text -> reference and reference -> cited-by (APA and numeric)
+# 6) Online verification: DOI lookup + bibliographic search against Crossref and OpenAlex
 
 import re
 import io
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
@@ -17,6 +19,9 @@ from collections import defaultdict, Counter
 
 import streamlit as st
 import pandas as pd
+import requests
+from rapidfuzz import fuzz
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # ----------------------------
 # Optional dependencies
@@ -71,6 +76,9 @@ ORG_ALIASES = {
     "unicef": ["unicef", "united nations children's fund", "united nations childrens fund"],
 }
 ORG_ACRONYMS = {k.upper() for k in ["WHO", "UN", "OECD", "IMF", "UNESCO", "UNICEF", "WORLD BANK", "IBRD"]}
+
+CROSSREF_API = "https://api.crossref.org/works"
+OPENALEX_API = "https://api.openalex.org/works"
 
 
 # ============================
@@ -618,6 +626,289 @@ def build_missing_uncited(cites: List[InTextCitation], refs: List[ReferenceEntry
 
 
 # ============================
+# Online verification helpers
+# ============================
+def build_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "citation-crosscheck/2.0 (streamlit)"})
+    return s
+
+SESSION = build_session()
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=6))
+def _get_json(url: str, params: dict) -> dict:
+    r = SESSION.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+def extract_doi(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r"https?://doi\.org/(10\.\d{4,9}/[^\s<>\"]+)", text, flags=re.I)
+    if m:
+        doi = m.group(1)
+    else:
+        m2 = re.search(r"(10\.\d{4,9}/[^\s<>\"]+)", text, flags=re.I)
+        if not m2:
+            return None
+        doi = m2.group(1)
+
+    doi = doi.strip().strip(").,;:]}>\"'")
+    doi = re.sub(r"&quot;|&gt;|&lt;|&amp;", "", doi)
+    doi = doi.strip().strip(").,;:]}>\"'")
+    return doi if doi.lower().startswith("10.") else None
+
+def _as_int_year(y: Optional[str]) -> Optional[int]:
+    if not y:
+        return None
+    m = re.search(r"(16|17|18|19|20)\d{2}", str(y))
+    return int(m.group(0)) if m else None
+
+@st.cache_data(show_spinner=False)
+def crossref_lookup_by_doi(doi: str) -> Optional[dict]:
+    try:
+        data = _get_json(f"{CROSSREF_API}/{doi}", params={})
+        return data.get("message")
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False)
+def crossref_search(query: str, rows: int = 10) -> List[dict]:
+    data = _get_json(CROSSREF_API, params={"query.bibliographic": query, "rows": rows})
+    return data.get("message", {}).get("items", []) or []
+
+@st.cache_data(show_spinner=False)
+def openalex_search(query: str, per_page: int = 10) -> List[dict]:
+    data = _get_json(OPENALEX_API, params={"search": query, "per-page": per_page})
+    return data.get("results", []) or []
+
+def crossref_item_year(it: dict) -> Optional[int]:
+    for key in ["issued", "published-print", "published-online", "created"]:
+        dp = (it.get(key, {}) or {}).get("date-parts", [])
+        if dp and dp[0]:
+            try:
+                return int(dp[0][0])
+            except Exception:
+                pass
+    return None
+
+def crossref_first_author_family(it: dict) -> str:
+    authors = it.get("author") or []
+    fam = authors[0].get("family") if authors else ""
+    return fam or ""
+
+def crossref_title(it: dict) -> str:
+    t = it.get("title") or []
+    return (t[0] if t else "") or ""
+
+def openalex_year(it: dict) -> Optional[int]:
+    y = it.get("publication_year")
+    try:
+        return int(y) if y else None
+    except Exception:
+        return None
+
+def openalex_first_author_family(it: dict) -> str:
+    authorships = it.get("authorships") or []
+    if not authorships:
+        return ""
+    dn = (authorships[0].get("author") or {}).get("display_name") or ""
+    return (dn.split()[-1] if dn else "") or ""
+
+def openalex_title(it: dict) -> str:
+    return (it.get("title") or "") or ""
+
+def openalex_doi(it: dict) -> str:
+    ids = it.get("ids") or {}
+    d = ids.get("doi") or ""
+    if d:
+        d = d.replace("https://doi.org/", "").strip()
+        d = d.strip(").,;:]}>\"'")
+    return d
+
+def author_match_ok(ref_surname: str, cand_surname: str) -> bool:
+    if not ref_surname or not cand_surname:
+        return False
+    return norm_token(ref_surname) == norm_token(cand_surname)
+
+def year_match_ok(ref_year: Optional[int], cand_year: Optional[int]) -> bool:
+    if ref_year is None or cand_year is None:
+        return False
+    if ref_year == cand_year:
+        return True
+    return abs(ref_year - cand_year) == 1
+
+def guess_title_snippet(ref: str) -> str:
+    r = norm_space(ref)
+    # remove DOI noise
+    r = re.sub(r"https?://doi\.org/\S+", " ", r, flags=re.I)
+    r = re.sub(r"\b10\.\d{4,9}/\S+", " ", r, flags=re.I)
+    # remove year parens content to focus on title
+    r = re.sub(rf"\(.*?\b{YEAR}\b.*?\)", " ", r)
+    r = norm_space(r)
+    # drop leading author segment up to first period if present
+    r = re.sub(r"^[^\.]{1,220}\.\s*", " ", r)
+    r = norm_space(r)
+    words = r.split()
+    return " ".join(words[:22])[:260]
+
+def verify_reference_online(
+    ref_obj: ReferenceEntry,
+    throttle_s: float = 0.25,
+    use_crossref: bool = True,
+    use_openalex: bool = True,
+) -> dict:
+    ref_entry = ref_obj.raw or ""
+    doi = extract_doi(ref_entry)
+
+    ref_year = _as_int_year(ref_obj.year)
+    # for author-year keys we have first surname
+    ref_surname = ""
+    if ref_obj.key.startswith("au_") and ref_obj.surnames:
+        ref_surname = ref_obj.surnames[0] or ""
+    who_is_org = ref_obj.key.startswith("org_")
+
+    title_snip = guess_title_snippet(ref_entry)
+
+    # Throttle calls a little
+    time.sleep(max(0.0, float(throttle_s or 0.0)))
+
+    # Prefer DOI lookup if DOI exists
+    if doi and use_crossref:
+        cr = crossref_lookup_by_doi(doi)
+        if cr:
+            y = crossref_item_year(cr)
+            fam = crossref_first_author_family(cr)
+            title = crossref_title(cr)
+            return {
+                "status": "verified",
+                "source": "crossref_doi",
+                "score": 100,
+                "doi": doi,
+                "matched_year": str(y or ""),
+                "matched_first_author": fam,
+                "matched_title": (title or "")[:180],
+                "query_used": "doi_lookup",
+                "error_crossref": "",
+                "error_openalex": "",
+            }
+        return {
+            "status": "not_found",
+            "source": "crossref_doi",
+            "score": 0,
+            "doi": doi,
+            "matched_year": "",
+            "matched_first_author": "",
+            "matched_title": "",
+            "query_used": "doi_lookup",
+            "error_crossref": "",
+            "error_openalex": "",
+        }
+
+    # Build a query
+    parts = []
+    if ref_surname:
+        parts.append(ref_surname)
+    if ref_year:
+        parts.append(str(ref_year))
+    if title_snip:
+        parts.append(title_snip)
+    query = " ".join(parts).strip() or ref_entry[:200]
+
+    best = {
+        "status": "not_found",
+        "source": "",
+        "score": 0,
+        "doi": doi or "",
+        "matched_year": "",
+        "matched_first_author": "",
+        "matched_title": "",
+        "query_used": query[:220],
+        "error_crossref": "",
+        "error_openalex": "",
+    }
+
+    # Crossref search
+    if use_crossref:
+        try:
+            items = crossref_search(query, rows=10)
+            for it in items:
+                cand_year = crossref_item_year(it)
+                cand_fam = crossref_first_author_family(it)
+                cand_title = crossref_title(it)
+                cand_doi = (it.get("DOI") or "").strip()
+
+                # filters if we have surname/year
+                if not who_is_org:
+                    if ref_surname and cand_fam and not author_match_ok(ref_surname, cand_fam):
+                        continue
+                    if ref_year and cand_year and not year_match_ok(ref_year, cand_year):
+                        continue
+                else:
+                    if ref_year and cand_year and not year_match_ok(ref_year, cand_year):
+                        continue
+
+                score = fuzz.WRatio(title_snip, cand_title) if (title_snip and cand_title) else 70
+                status = "verified" if score >= 90 else ("likely" if score >= 82 else "needs_review")
+
+                if score > best["score"]:
+                    best = {
+                        "status": status,
+                        "source": "crossref",
+                        "score": int(score),
+                        "doi": cand_doi,
+                        "matched_year": str(cand_year or ""),
+                        "matched_first_author": cand_fam,
+                        "matched_title": (cand_title or "")[:180],
+                        "query_used": query[:220],
+                        "error_crossref": "",
+                        "error_openalex": best.get("error_openalex", ""),
+                    }
+        except Exception as e:
+            best["error_crossref"] = str(e)[:220]
+
+    # OpenAlex search
+    if use_openalex:
+        try:
+            items = openalex_search(query, per_page=10)
+            for it in items:
+                cand_year = openalex_year(it)
+                cand_fam = openalex_first_author_family(it)
+                cand_title = openalex_title(it)
+                cand_doi = openalex_doi(it)
+
+                if not who_is_org:
+                    if ref_surname and cand_fam and not author_match_ok(ref_surname, cand_fam):
+                        continue
+                    if ref_year and cand_year and not year_match_ok(ref_year, cand_year):
+                        continue
+                else:
+                    if ref_year and cand_year and not year_match_ok(ref_year, cand_year):
+                        continue
+
+                score = fuzz.WRatio(title_snip, cand_title) if (title_snip and cand_title) else 70
+                status = "verified" if score >= 90 else ("likely" if score >= 82 else "needs_review")
+
+                if score > best["score"]:
+                    best = {
+                        "status": status,
+                        "source": "openalex",
+                        "score": int(score),
+                        "doi": cand_doi,
+                        "matched_year": str(cand_year or ""),
+                        "matched_first_author": cand_fam,
+                        "matched_title": (cand_title or "")[:180],
+                        "query_used": query[:220],
+                        "error_crossref": best.get("error_crossref", ""),
+                        "error_openalex": "",
+                    }
+        except Exception as e:
+            best["error_openalex"] = str(e)[:220]
+
+    return best
+
+
+# ============================
 # Streamlit UI
 # ============================
 st.set_page_config(page_title="Citation Crosschecker", layout="wide")
@@ -806,8 +1097,84 @@ with right:
         mime="text/csv",
     )
 
+# ============================
+# Online verification (Crossref + OpenAlex)
+# ============================
+st.divider()
+st.subheader("Online verification (Crossref + OpenAlex)")
+
+enable_verify = st.checkbox("Enable online verification", value=False)
+use_crossref = st.checkbox("Use Crossref", value=True, disabled=not enable_verify)
+use_openalex = st.checkbox("Use OpenAlex", value=True, disabled=not enable_verify)
+throttle = st.slider("Throttle seconds between queries", 0.0, 2.0, 0.25, 0.05, disabled=not enable_verify)
+max_to_check = st.number_input("Max references to verify (for speed)", min_value=10, max_value=5000, value=min(200, max(10, len(refs))), step=10, disabled=not enable_verify)
+
+df_verify = pd.DataFrame()
+
+if enable_verify:
+    # quick connectivity test to give clean error messages
+    test_ok = True
+    test_msg = ""
+    if use_crossref:
+        try:
+            _ = _get_json(CROSSREF_API, {"rows": 1})
+        except Exception as e:
+            test_ok = False
+            test_msg = str(e)[:220]
+
+    if (use_crossref and not test_ok) and (not use_openalex):
+        st.error("Online verification can’t reach Crossref from this deployment.")
+        st.write(f"Error: {test_msg}")
+    else:
+        rows = []
+        progress = st.progress(0)
+        work = refs[: int(max_to_check)]
+        total = len(work) if work else 1
+
+        for i, r in enumerate(work):
+            res = verify_reference_online(
+                r,
+                throttle_s=float(throttle),
+                use_crossref=bool(use_crossref),
+                use_openalex=bool(use_openalex),
+            )
+            rows.append(
+                {
+                    "reference": (r.raw[:240] + "…") if len(r.raw) > 240 else r.raw,
+                    "status": res.get("status", ""),
+                    "source": res.get("source", ""),
+                    "score": res.get("score", ""),
+                    "doi": res.get("doi", ""),
+                    "matched_year": res.get("matched_year", ""),
+                    "matched_first_author": res.get("matched_first_author", ""),
+                    "matched_title": res.get("matched_title", ""),
+                    "query_used": res.get("query_used", ""),
+                    "error_crossref": res.get("error_crossref", ""),
+                    "error_openalex": res.get("error_openalex", ""),
+                }
+            )
+            progress.progress(int((i + 1) / total * 100))
+
+        df_verify = pd.DataFrame(rows)
+        st.dataframe(df_verify, use_container_width=True, height=460)
+        st.download_button(
+            "Download verification (CSV)",
+            df_verify.to_csv(index=False).encode("utf-8"),
+            file_name="online_verification.csv",
+            mime="text/csv",
+        )
+
+        flagged = df_verify[df_verify["status"].isin(["not_found", "needs_review"])]
+        if len(flagged) > 0:
+            st.warning(f"Flagged {len(flagged)} items as Not found or Needs review. Check these first.")
+            with st.expander("Show flagged only"):
+                st.dataframe(flagged, use_container_width=True, height=360)
+
 with st.expander("Diagnostics"):
     st.markdown("#### Sample extracted in-text citations (first 120)")
     st.dataframe(pd.DataFrame([c.__dict__ for c in cites[:120]]), use_container_width=True)
     st.markdown("#### Sample parsed references (first 120)")
     st.dataframe(pd.DataFrame([r.__dict__ for r in refs[:120]]), use_container_width=True)
+    if enable_verify and not df_verify.empty:
+        st.markdown("#### Sample verification output (first 60)")
+        st.dataframe(df_verify.head(60), use_container_width=True)
