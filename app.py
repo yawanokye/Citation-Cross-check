@@ -515,30 +515,7 @@ def split_reference_entries(ref_text: str) -> List[str]:
         big = norm_spaces(ref_text)
         return [big] if big else []
     return entries
-
-
-def parse_reference_numeric(ref_raw: str) -> Optional[ReferenceEntry]:
-    r = (ref_raw or "").strip()
-    if not r:
-        return None
-
-    m = re.match(r"^\s*\[\s*(\d+)\s*\]\s*(.+)$", r)
-    if m:
-        n = int(m.group(1))
-        return ReferenceEntry(raw=r, key=key_numeric(n), pretty=f"[{n}]", number=n, author_or_org="", year="")
-
-    m = re.match(r"^\s*(\d+)\s*[\.\)]\s*(.+)$", r)
-    if m:
-        n = int(m.group(1))
-        return ReferenceEntry(raw=r, key=key_numeric(n), pretty=str(n), number=n, author_or_org="", year="")
-
-    m = re.match(r"^\s*(\d+)\s+(.+)$", r)
-    if m:
-        n = int(m.group(1))
-        return ReferenceEntry(raw=r, key=key_numeric(n), pretty=str(n), number=n, author_or_org="", year="")
-
-    return None
-def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
+    def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
 
     r = (ref_raw or "").strip()
     if not r:
@@ -570,8 +547,6 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
         author_or_org=first_author,
         year=y,
     )
-
-
 
 
     surnames = _extract_surnames_from_author_segment(pre, max_n=2)
@@ -1862,6 +1837,7 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
 
