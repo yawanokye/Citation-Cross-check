@@ -541,77 +541,159 @@ def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
 # ============================
 # Reconciliation
 # ============================
-def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ref_by_key = defaultdict(list)
+# ============================
+# Reconciliation (SAFE VERSION)
+# ============================
+
+def reconcile_author_year(
+    cites: List[InTextCitation],
+    refs: List[ReferenceEntry],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+    # Map references by key
+    ref_by_key: Dict[str, List[ReferenceEntry]] = defaultdict(list)
     for r in refs:
         ref_by_key[r.key].append(r)
 
+    # ----------------------------
+    # In-text → Reference
+    # ----------------------------
     rows = []
     for c in cites:
         hits = ref_by_key.get(c.key, [])
+
         if not hits:
-            rows.append({"in_text": c.raw, "status": "not_found", "matched_reference": ""})
+            rows.append(
+                {
+                    "in_text": c.raw,
+                    "status": "not_found",
+                    "matched_reference": "",
+                }
+            )
         elif len(hits) == 1:
-            rows.append({"in_text": c.raw, "status": "matched", "matched_reference": hits[0].raw})
+            rows.append(
+                {
+                    "in_text": c.raw,
+                    "status": "matched",
+                    "matched_reference": hits[0].raw,
+                }
+            )
         else:
             rows.append(
                 {
                     "in_text": c.raw,
                     "status": f"ambiguous ({len(hits)})",
-                    "matched_reference": " || ".join(h.raw[:200] for h in hits),
+                    "matched_reference": " || ".join(h.raw for h in hits),
                 }
             )
-    df_c2r = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["in_text", "status", "matched_reference"])
 
-    cite_group = defaultdict(list)
+    df_c2r = pd.DataFrame(
+        rows,
+        columns=["in_text", "status", "matched_reference"],
+    )
+
+    # ----------------------------
+    # Reference → cited by
+    # ----------------------------
+    cite_group: Dict[str, List[str]] = defaultdict(list)
     for c in cites:
         cite_group[c.key].append(c.raw)
 
     ref_rows = []
     for r in refs:
         cited_by = cite_group.get(r.key, [])
+
         ref_rows.append(
             {
                 "reference": r.raw,
                 "times_cited": int(len(cited_by)),
-                "cited_by": "; ".join(cited_by[:12]) + (" ..." if len(cited_by) > 12 else ""),
+                "cited_by": "; ".join(cited_by[:20]),
             }
         )
-    df_r2c = pd.DataFrame(ref_rows) if ref_rows else pd.DataFrame(columns=["reference", "times_cited", "cited_by"])
-    if len(df_r2c):
-        df_r2c = df_r2c.sort_values(["times_cited", "reference"], ascending=[False, True]).reset_index(drop=True)
+
+    # CRITICAL FIX: force columns to exist
+    df_r2c = pd.DataFrame(
+        ref_rows,
+        columns=["reference", "times_cited", "cited_by"],
+    )
+
+    # Only sort if column exists and dataframe not empty
+    if not df_r2c.empty and "times_cited" in df_r2c.columns:
+        df_r2c = df_r2c.sort_values(
+            by=["times_cited", "reference"],
+            ascending=[False, True],
+        ).reset_index(drop=True)
 
     return df_c2r, df_r2c
 
-def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+def reconcile_numeric(
+    cites: List[InTextCitation],
+    refs: List[ReferenceEntry],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
     ref_by_key = {r.key: r for r in refs}
 
+    # ----------------------------
+    # In-text → Reference
+    # ----------------------------
     rows = []
     for c in cites:
-        r = ref_by_key.get(c.key)
-        if not r:
-            rows.append({"in_text": c.raw, "status": "not_found", "matched_reference": ""})
-        else:
-            rows.append({"in_text": c.raw, "status": "matched", "matched_reference": r.raw})
-    df_c2r = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["in_text", "status", "matched_reference"])
 
-    cite_group = defaultdict(list)
+        r = ref_by_key.get(c.key)
+
+        if r is None:
+            rows.append(
+                {
+                    "in_text": c.raw,
+                    "status": "not_found",
+                    "matched_reference": "",
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "in_text": c.raw,
+                    "status": "matched",
+                    "matched_reference": r.raw,
+                }
+            )
+
+    df_c2r = pd.DataFrame(
+        rows,
+        columns=["in_text", "status", "matched_reference"],
+    )
+
+    # ----------------------------
+    # Reference → cited by
+    # ----------------------------
+    cite_group: Dict[str, List[str]] = defaultdict(list)
     for c in cites:
         cite_group[c.key].append(c.raw)
 
     ref_rows = []
     for r in refs:
+
         cited_by = cite_group.get(r.key, [])
+
         ref_rows.append(
             {
                 "reference": r.raw,
                 "times_cited": int(len(cited_by)),
-                "cited_by": "; ".join(cited_by[:18]) + (" ..." if len(cited_by) > 18 else ""),
+                "cited_by": "; ".join(cited_by[:20]),
             }
         )
-    df_r2c = pd.DataFrame(ref_rows) if ref_rows else pd.DataFrame(columns=["reference", "times_cited", "cited_by"])
-    if len(df_r2c):
-        df_r2c = df_r2c.sort_values(["times_cited", "reference"], ascending=[False, True]).reset_index(drop=True)
+
+    df_r2c = pd.DataFrame(
+        ref_rows,
+        columns=["reference", "times_cited", "cited_by"],
+    )
+
+    if not df_r2c.empty and "times_cited" in df_r2c.columns:
+        df_r2c = df_r2c.sort_values(
+            by=["times_cited", "reference"],
+            ascending=[False, True],
+        ).reset_index(drop=True)
 
     return df_c2r, df_r2c
 
@@ -1176,3 +1258,4 @@ with st.expander("Diagnostics"):
     if enable_verify and not df_verify.empty:
         st.markdown("#### Sample verification output (first 60)")
         st.dataframe(df_verify.head(60), use_container_width=True)
+
