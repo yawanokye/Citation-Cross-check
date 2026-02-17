@@ -39,7 +39,7 @@ except Exception:
 
 
 # =============================
-# Usage counter system (Streamlit Cloud safe)
+# Usage counter system (Streamlit Cloud "safe" but not persistent across restarts)
 # =============================
 USAGE_FILE = os.path.join(tempfile.gettempdir(), "usage_stats.json")
 
@@ -104,7 +104,7 @@ REF_HEADINGS = [
     r"^\s*literature\s+cited\s*[:|]?\s*$",
 ]
 
-# Expand org aliases as you requested (WHO/World Health Organisation, UN/United Nations, AU, EU, etc.)
+# Expand org aliases (WHO/World Health Organisation, UN/United Nations, AU, EU, etc.)
 ORG_ALIASES: Dict[str, List[str]] = {
     "unctad": ["unctad", "united nations conference on trade and development"],
     "who": ["who", "world health organization", "world health organisation"],
@@ -119,7 +119,11 @@ ORG_ALIASES: Dict[str, List[str]] = {
     "un": ["un", "united nations", "u.n.", "united nations organisation", "united nations organization"],
     "au": ["au", "african union"],
     "eu": ["eu", "european union"],
-    "unesco": ["unesco", "united nations educational, scientific and cultural organization", "united nations educational scientific and cultural organization"],
+    "unesco": [
+        "unesco",
+        "united nations educational, scientific and cultural organization",
+        "united nations educational scientific and cultural organization",
+    ],
     "unicef": ["unicef", "united nations children's fund", "united nations childrens fund"],
 }
 
@@ -238,16 +242,12 @@ def looks_like_person_surname(token: str) -> bool:
     if not token:
         return False
     t = token.strip()
-
     if re.search(r"(?:'s|’s)$", t, flags=re.IGNORECASE):
         return False
-
     if not re.fullmatch(r"[A-Z][A-Za-z\-']{1,40}", t):
         return False
-
     if norm_token(t) in NONNAME_STOPWORDS:
         return False
-
     return True
 
 
@@ -257,10 +257,8 @@ def _first_surname_from_author_blob(blob: str) -> Optional[str]:
     b = blob.strip()
     b = re.sub(r"^(see|e\.g\.|cf\.)\s+", "", b, flags=re.IGNORECASE).strip()
     b = re.sub(r"\s+et\s+al\.?$", "", b, flags=re.IGNORECASE).strip()
-
     first = b.split(",")[0].strip()
     first = re.split(r"\s+(?:and|&)\s+", first, flags=re.IGNORECASE)[0].strip()
-
     m = re.search(r"([A-Z][A-Za-z\-']+)", first)
     return m.group(1) if m else None
 
@@ -395,7 +393,10 @@ def split_by_heading_or_autodetect(text: str) -> Tuple[str, str, str]:
         # prefer later auto start if it looks safer (PDF spillover)
         if auto_conf >= 0.55 and auto_idx > heading_idx + 3:
             chosen = auto_idx
-            reason = f"Found heading: {heading_line}, but used auto-detect later start (confidence {auto_conf:.2f}) to avoid PDF spillover."
+            reason = (
+                f"Found heading: {heading_line}, but used auto-detect later start "
+                f"(confidence {auto_conf:.2f}) to avoid PDF spillover."
+            )
 
     main = "\n".join(lines[:chosen]).strip()
     refs = "\n".join(lines[chosen:]).strip()
@@ -407,23 +408,25 @@ def split_by_heading_or_autodetect(text: str) -> Tuple[str, str, str]:
 # =============================
 def _strip_leading_numbering(s: str) -> str:
     x = (s or "").strip()
-    # [12] ...
-    x = re.sub(r"^\s*\[\s*\d+\s*\]\s*", "", x)
-    # 12. ... or 12) ...
-    x = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", x)
+    x = re.sub(r"^\s*\[\s*\d+\s*\]\s*", "", x)           # [12] ...
+    x = re.sub(r"^\s*\d+\s*[\.\)]\s*", "", x)            # 12. ... or 12) ...
     return x.strip()
 
 
 def split_reference_entries(ref_text: str) -> List[str]:
     """
-    Robust splitter for reference lists where entries may start with:
-      1.  / 1) / [1]
-    and may be on multiple lines.
+    Robust splitter for reference lists:
+    - Numeric: [1] / 1. / 1)
+    - APA/Harvard: lines that start like "Surname, ... (2020)" or "Surname, ... 2020"
+    Handles multi-line entries by buffering continuation lines.
     """
     t = (ref_text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = [ln.rstrip() for ln in t.split("\n")]
 
-    start_pat = re.compile(r"^\s*(?:\[\s*\d+\s*\]|\d+\s*[\.\)])\s+")
+    numeric_start = re.compile(r"^\s*(?:\[\s*\d+\s*\]|\d+\s*[\.\)])\s+")
+    apa_start = re.compile(rf"^\s*[A-Z][A-Za-z\-']+\s*,.*\(\s*{YEAR}\s*\)")
+    harvard_start = re.compile(rf"^\s*[A-Z][A-Za-z\-']+\s*,.*\b{YEAR}\b")
+
     entries: List[str] = []
     buf: List[str] = []
 
@@ -438,17 +441,23 @@ def split_reference_entries(ref_text: str) -> List[str]:
     for ln in lines:
         if not ln.strip():
             continue
-        if start_pat.match(ln):
+
+        is_new = False
+        if numeric_start.match(ln):
+            is_new = True
+        else:
+            head = ln.strip()
+            if apa_start.match(head) or (harvard_start.match(head) and "(" not in head[:60]):
+                is_new = True
+
+        if is_new:
             flush()
             buf.append(ln.strip())
         else:
-            # continuation line
             buf.append(ln.strip())
 
     flush()
 
-    # If numbering not present, fall back: split by blank-line style (already removed blanks),
-    # or return single block.
     if not entries:
         big = norm_spaces(ref_text)
         return [big] if big else []
@@ -463,7 +472,7 @@ def parse_reference_numeric(ref_raw: str) -> Optional[ReferenceEntry]:
       1. ...
       1) ...
       1 ...
-    (the last one is common in some PDFs where punctuation is lost)
+    (last one occurs in PDFs where punctuation is lost)
     """
     r = (ref_raw or "").strip()
     if not r:
@@ -472,16 +481,13 @@ def parse_reference_numeric(ref_raw: str) -> Optional[ReferenceEntry]:
     m = re.match(r"^\s*\[\s*(\d+)\s*\]\s*(.+)$", r)
     if m:
         n = int(m.group(1))
-        body = m.group(2).strip()
         return ReferenceEntry(raw=r, key=key_numeric(n), pretty=f"[{n}]", number=n, author_or_org="", year="")
 
     m = re.match(r"^\s*(\d+)\s*[\.\)]\s*(.+)$", r)
     if m:
         n = int(m.group(1))
-        body = m.group(2).strip()
         return ReferenceEntry(raw=r, key=key_numeric(n), pretty=str(n), number=n, author_or_org="", year="")
 
-    # loose: "1 Adam and Kofi ..."
     m = re.match(r"^\s*(\d+)\s+(.+)$", r)
     if m:
         n = int(m.group(1))
@@ -496,7 +502,7 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
     Supports:
       Surname, ... (2020).
       Surname, ... 2020.
-      WHO (2020) / World Health Organisation (2020) / UN (2020) etc.
+      WHO (2020) / World Health Organisation (2020) / UN (2020)
     """
     r = (ref_raw or "").strip()
     if not r:
@@ -522,7 +528,6 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
             k = key_author_year(au, y)
             return ReferenceEntry(raw=r, key=k, pretty=f"{titleish(au)} {y}", author_or_org=au, year=y)
 
-    # fallback: try to find any year, but key will be weak (avoid false matches)
     return None
 
 
@@ -700,10 +705,7 @@ def extract_vancouver_numeric_citations(
     for m in sup_run.finditer(text or ""):
         s = m.group(0)
 
-        prev_ch = (text[m.start() - 1] if m.start() > 0 else "")
         next_ch = (text[m.end()] if m.end() < len(text) else "")
-
-        # keep this permissive: superscripts often stick to the end of a word
         if next_ch and not (next_ch.isspace() or next_ch in ".,;:)]}!?"):
             continue
 
@@ -724,7 +726,7 @@ def extract_vancouver_numeric_citations(
             for n in range(a, b + 1):
                 out.append(InTextCitation("numeric", raw, key_numeric(n), f"{n}", number=n))
 
-    # ---------- NEW: plain digit clusters (lost superscript formatting) ----------
+    # ---------- plain digit clusters (lost superscript formatting) ----------
     if allow_plain_clusters:
         plain_cluster_pat = re.compile(
             r"""
@@ -773,6 +775,11 @@ def extract_vancouver_numeric_citations(
 
         for m in plain_cluster_pat.finditer(text or ""):
             raw_cluster = m.group("cluster")
+
+            # context filter to avoid Table/Figure/Eq numbering (common in PDFs)
+            left_context = (text[max(0, m.start() - 25): m.start()] or "").lower()
+            if any(w in left_context for w in ["table", "figure", "fig", "eq", "equation", "chapter", "appendix"]):
+                continue
 
             # avoid years and decimals
             if re.search(r"\b(19|20)\d{2}\b", raw_cluster):
@@ -833,7 +840,13 @@ def find_year_mismatches(cite_keys: List[str], ref_keys: List[str]) -> pd.DataFr
 # =============================
 def build_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "citation-crosscheck/1.6"})
+    # Put a real email address here to reduce throttling (Crossref/OpenAlex prefer this)
+    s.headers.update(
+        {
+            "User-Agent": "citation-crosscheck/1.6 (mailto:your_email@example.com)",
+            "Accept": "application/json",
+        }
+    )
     return s
 
 
@@ -866,7 +879,7 @@ def extract_doi(text: str) -> Optional[str]:
     return doi if doi.lower().startswith("10.") else None
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=86400)
 def crossref_lookup_by_doi(doi: str) -> Optional[dict]:
     try:
         data = _get_json(f"{CROSSREF_API}/{doi}", params={})
@@ -875,15 +888,18 @@ def crossref_lookup_by_doi(doi: str) -> Optional[dict]:
         return None
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=86400)
 def crossref_search(query: str, rows: int = 10) -> List[dict]:
     data = _get_json(CROSSREF_API, params={"query.bibliographic": query, "rows": rows})
     return data.get("message", {}).get("items", []) or []
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=86400)
 def openalex_search(query: str, per_page: int = 10) -> List[dict]:
-    data = _get_json(OPENALEX_API, params={"search": query, "per-page": per_page})
+    data = _get_json(
+        OPENALEX_API,
+        params={"search": query, "per-page": per_page, "mailto": "your_email@example.com"},
+    )
     return data.get("results", []) or []
 
 
@@ -1319,7 +1335,7 @@ style = st.selectbox(
     ["APA/Harvard (author–year)", "IEEE (numeric [1])", "Vancouver (numeric 1)"],
 )
 
-# Vancouver options (covers (1) vs [1] vs superscript, and plain 1,2,3 / 1 2 3 / 1-3)
+# Vancouver options
 v_allow_plain = True
 v_strict_plain = False
 if style.startswith("Vancouver"):
@@ -1356,11 +1372,11 @@ if not text.strip():
 increment_once_per_session("counted_app_run", app_run=True)
 
 main_text, ref_text, ref_msg = split_by_heading_or_autodetect(text)
+auto_idx, auto_conf = auto_detect_references_start(text)
 
 st.subheader("References detection")
 st.write(ref_msg)
-
-auto_idx, auto_conf = auto_detect_references_start(text)
+st.caption(f"Auto-detect confidence: {auto_conf:.2f}")
 
 force_manual = ("No heading found" in ref_msg) and (auto_conf < 0.60)
 manual = st.checkbox(
@@ -1432,6 +1448,7 @@ target_style = st.selectbox(
 enrich_with_doi = st.checkbox(
     "Improve formatting using DOI metadata (Crossref lookup when DOI exists)",
     value=False,
+    help="Current version keeps formatting simple. DOI enrichment can be added to rebuild full APA fields if you want.",
 )
 
 if st.button("Generate reformatted References list"):
@@ -1571,6 +1588,17 @@ use_crossref = st.checkbox("Use Crossref", value=True, disabled=not enable_verif
 use_openalex = st.checkbox("Use OpenAlex", value=True, disabled=not enable_verify)
 throttle = st.slider("Throttle seconds between queries", 0.0, 2.0, 0.25, 0.05, disabled=not enable_verify)
 
+max_verify = st.slider(
+    "Max references to verify (to keep it fast)",
+    0, 500, 80, 10,
+    disabled=not enable_verify,
+)
+doi_only = st.checkbox(
+    "Verify only references that contain a DOI (fastest and most accurate)",
+    value=True,
+    disabled=not enable_verify,
+)
+
 df_verify = pd.DataFrame()
 
 if enable_verify:
@@ -1587,11 +1615,17 @@ if enable_verify:
         st.error("Online verification can’t reach Crossref from this deployment.")
         st.write(f"Error: {test_msg}")
     else:
+        refs_to_check = refs[:] if refs else []
+        if doi_only:
+            refs_to_check = [r for r in refs_to_check if extract_doi(r.raw or "")]
+        if max_verify > 0:
+            refs_to_check = refs_to_check[:max_verify]
+
         rows = []
         progress = st.progress(0)
-        total = len(refs) if refs else 1
+        total = len(refs_to_check) if refs_to_check else 1
 
-        for i, r in enumerate(refs):
+        for i, r in enumerate(refs_to_check):
             res = verify_reference_online(
                 r,
                 throttle_s=throttle,
