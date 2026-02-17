@@ -1,14 +1,13 @@
-streamlit==1.41.1
-pandas==2.2.3
-numpy==1.26.4
+streamlit>=1.35
+pandas>=2.2
+requests>=2.32
+rapidfuzz>=3.9
+tenacity>=9.0
 
-requests==2.31.0
-rapidfuzz==3.9.7
-tenacity==8.2.3
+# DOCX support
+python-docx>=1.1
 
-reportlab==4.0.8
-python-docx==1.1.0
-
-pdfplumber==0.10.3
-pdfminer.six==20221105
-Pillow==10.2.0
+# PDF support (optional but recommended)
+pdfplumber>=0.11
+pdfminer.six>=20240706
+pillow>=10.4
