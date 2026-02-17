@@ -538,22 +538,22 @@ def parse_reference_numeric(ref_raw: str) -> Optional[ReferenceEntry]:
         return ReferenceEntry(raw=r, key=key_numeric(n), pretty=str(n), number=n, author_or_org="", year="")
 
     return None
-
-
 def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
+
     r = (ref_raw or "").strip()
     if not r:
         return None
 
     base = _strip_leading_numbering(r)
 
+    # find year
     ym = re.search(r"\b(19|20)\d{2}\b", base)
     if not ym:
         return None
 
-    year = ym.group(0)
+    y = ym.group(0)
 
-    # extract first author surname ONLY
+    # extract first author surname only
     m = re.match(r"^\s*([A-Z][A-Za-z\-']+)\s*,", base)
 
     if not m:
@@ -561,15 +561,17 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
 
     first_author = m.group(1)
 
-    key = f"au_{first_author.lower()}_{year}"
+    k = key_author_year(first_author, y)
 
     return ReferenceEntry(
         raw=r,
-        key=key,
-        pretty=f"{first_author} ({year})",
+        key=k,
+        pretty=f"{first_author} ({y})",
         author_or_org=first_author,
-        year=year,
+        year=y,
     )
+
+
 
 
     surnames = _extract_surnames_from_author_segment(pre, max_n=2)
@@ -1860,5 +1862,6 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
 
