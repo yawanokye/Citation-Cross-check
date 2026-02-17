@@ -574,7 +574,11 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
 
     surnames = _extract_surnames_from_author_segment(pre, max_n=2)
     if surnames and looks_like_person_surname(surnames[0]):
-        k = key_author_year_surnames(surnames, y)
+        first_author = surnames[0] if surnames else ""
+if not first_author:
+    continue
+key = key_author_year(first_author, y)
+
         return ReferenceEntry(raw=r, key=k, pretty=f"{titleish(surnames[0])} {y}", author_or_org=surnames[0], year=y)
 
     return None
@@ -612,7 +616,11 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             continue
 
         disp_authors = format_author_blob_for_display(authors_blob)
-        key = key_author_year_surnames(surnames, y)
+        first_author = surnames[0] if surnames else ""
+if not first_author:
+    continue
+key = key_author_year(first_author, y)
+
         pretty = f"{disp_authors} ({y})"
         out.append(InTextCitation("author-year", m.group(0), key, pretty, surnames[0], y))
 
@@ -654,7 +662,11 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
                     continue
                 surnames = [first_author]
 
-            key = key_author_year_surnames(surnames, y)
+            first_author = surnames[0] if surnames else ""
+if not first_author:
+    continue
+key = key_author_year(first_author, y)
+
             out.append(InTextCitation("author-year", f"({p})", key, f"({p})", surnames[0], y))
 
     return out
@@ -1848,4 +1860,5 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
 
