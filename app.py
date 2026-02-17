@@ -1,13 +1,12 @@
 # app.py
 # Citation Crosschecker (APA/Harvard + IEEE + Vancouver)
-# Fixes included:
-# - Narrative citations now keep full strings like "Krejcie and Morgan (1970)"
-#   and "Bartlett, Kotrlik, and Higgins (2001)" (not just Morgan/Higgins).
-# - Stops counting bare years like "(1991)" as citations.
-# - Stops counting random sentences as citations.
-# - Shows uncited reference COUNT and full list.
-# - Adds IEEE style support ([1], [1-3], [1,2,5]).
-# - Adds reconciliation tables: in-text -> reference, reference -> cited by.
+# Key fixes:
+# 1) Narrative multi-author citations no longer generate extra single-author hits inside them
+#    (so "Krejcie and Morgan (1970)" will NOT also create "Morgan (1970)").
+# 2) Bare years like "(1991)" are ignored as citations.
+# 3) Missing/Uncited tables show FULL raw in-text citations and full reference entries.
+# 4) IEEE numeric supported: [1], [1-3], [1,2,5]
+# 5) Reconciliation tables: in-text -> reference and reference -> cited-by (APA and numeric)
 
 import re
 import io
@@ -55,7 +54,7 @@ NONCITE_LEADS = {
     "chapter", "section", "table", "figure", "eq", "equation", "appendix",
 }
 
-# If narrative capture grabs long phrases, reject unless it looks like names/org
+# narrative false-positive guard
 BAD_NARRATIVE_PREFIX_WORDS = {
     "traditional", "classical", "analytical", "for", "from", "in", "on", "at", "by",
     "methods", "method", "approach", "approaches", "sample", "size", "power",
@@ -209,6 +208,7 @@ def split_main_and_references_from_docx(paras: List[str]) -> Tuple[str, List[str
         if not buf:
             buf = p
             continue
+        # merge wrapped lines a bit
         if re.match(r"^\s*([a-z]|\d|\()", p):
             buf = (buf + " " + p).strip()
         else:
@@ -240,10 +240,12 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
         year = m.group(1)
         pre = r[: m.start()].strip()
 
+    # org reference
     if is_known_org(pre) or pre.upper() in ORG_ACRONYMS:
         k = f"org_{canon_org(pre)}_{year.lower()}"
         return ReferenceEntry(raw=r, key=k, year=year, surnames=(pre,), number=None)
 
+    # first author surname (reference list usually starts with "Surname, ...")
     if "," in pre:
         first = pre.split(",")[0].strip()
     else:
@@ -284,6 +286,17 @@ def parse_reference_numeric(ref_raw: str) -> Optional[ReferenceEntry]:
 def extract_author_year_citations(text: str) -> List[InTextCitation]:
     out: List[InTextCitation] = []
     txt = text or ""
+
+    # Track spans already captured so we don't re-capture pieces like "Morgan (1970)"
+    # inside "Krejcie and Morgan (1970)".
+    taken_spans: List[Tuple[int, int]] = []
+
+    def _overlaps(span: Tuple[int, int], spans: List[Tuple[int, int]]) -> bool:
+        a, b = span
+        for s, e in spans:
+            if a < e and b > s:
+                return True
+        return False
 
     # --- Parenthetical blocks that contain a year ---
     paren_blocks = re.finditer(rf"\(([^()]*\b{YEAR}\b[^()]*)\)", txt)
@@ -332,11 +345,12 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             out.append(InTextCitation("author-year", f"({norm_space(c)})", k, year=y, surnames=tuple(cand)))
 
     # ============================
-    # Narrative citations (FIXED)
+    # Narrative citations (FIXED + overlap-blocking)
     # ============================
 
     # 1) Multi-author narrative:
     #    Krejcie and Morgan (1970)
+    #    Bartlett, Kotrlik and Higgins (2001)
     #    Bartlett, Kotrlik, and Higgins (2001)
     #    Bartlett, Kotrlik, & Higgins (2001)
     narr_multi = re.finditer(
@@ -355,10 +369,13 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
     )
 
     for m in narr_multi:
+        span = (m.start(), m.end())
+        if _overlaps(span, taken_spans):
+            continue
+
         authors_blob = m.group("authors").strip()
         y = m.group("year")
 
-        # Reject if it starts with a narrative word (rare but protects false positives)
         first_word = norm_token(authors_blob.split()[0]) if authors_blob.split() else ""
         if first_word in BAD_NARRATIVE_PREFIX_WORDS:
             continue
@@ -372,8 +389,9 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         first = cand[0]
         k = key_author_year(first, y)
 
-        # Keep FULL raw, not last surname
+        # Keep FULL raw: "Krejcie and Morgan (1970)"
         out.append(InTextCitation("author-year", m.group(0), k, year=y, surnames=tuple(cand)))
+        taken_spans.append(span)
 
     # 2) "et al." narrative: A et al. (YEAR)
     narr_etal = re.finditer(
@@ -382,17 +400,27 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         flags=re.IGNORECASE,
     )
     for m in narr_etal:
+        span = (m.start(), m.end())
+        if _overlaps(span, taken_spans):
+            continue
+
         first = m.group("a").strip()
         y = m.group("y")
         if looks_like_surname(first):
             out.append(InTextCitation("author-year", m.group(0), key_author_year(first, y), year=y, surnames=(first,)))
+            taken_spans.append(span)
 
     # 3) Single-author narrative: A (YEAR) or ORG (YEAR)
+    #    IMPORTANT: skip any match that sits inside an already-captured multi-author narrative.
     narr_single = re.finditer(
         rf"\b(?P<author>[A-Z][A-Za-z\-']{{1,40}})\s*\(\s*(?P<year>{YEAR})\s*\)",
         txt,
     )
     for m in narr_single:
+        span = (m.start(), m.end())
+        if _overlaps(span, taken_spans):
+            continue
+
         au = m.group("author").strip()
         y = m.group("year")
 
@@ -407,7 +435,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
                 out.append(InTextCitation("author-year", m.group(0), key_author_year(au, y), year=y, surnames=(au,)))
 
     # De-dup by raw
-    uniq = []
+    uniq: List[InTextCitation] = []
     seen = set()
     for c in out:
         if c.raw not in seen:
@@ -423,6 +451,7 @@ _SUP_DIGITS = {
     "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
     "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
 }
+
 def _sup_to_int(s: str) -> Optional[int]:
     try:
         digits = "".join(_SUP_DIGITS.get(ch, "") for ch in s)
@@ -457,8 +486,9 @@ def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
 
 def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
     out: List[InTextCitation] = []
-    pat = re.compile(r"\(\s*(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\)")
-    for m in pat.finditer(text or ""):
+
+    paren = re.compile(r"\(\s*(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\)")
+    for m in paren.finditer(text or ""):
         inside = m.group(1)
         if re.fullmatch(rf"{YEAR}", inside.strip()):
             continue
@@ -556,7 +586,7 @@ def build_missing_uncited(cites: List[InTextCitation], refs: List[ReferenceEntry
     ref_keys = [r.key for r in refs]
 
     cite_count_by_raw = Counter([c.raw for c in cites])
-    cite_key_by_raw = {}
+    cite_key_by_raw: Dict[str, str] = {}
     for c in cites:
         cite_key_by_raw.setdefault(c.raw, c.key)
 
@@ -675,7 +705,6 @@ if not ref_lines:
     with st.expander("Paste References manually"):
         pasted_refs = st.text_area("Paste your References section here", height=220)
         if pasted_refs.strip():
-            # Keep lines but also try to merge wrapped entries a bit
             lines = [x.strip() for x in pasted_refs.splitlines() if x.strip()]
             merged = []
             buf = ""
@@ -778,7 +807,7 @@ with right:
     )
 
 with st.expander("Diagnostics"):
-    st.markdown("#### Sample extracted in-text citations (first 80)")
-    st.dataframe(pd.DataFrame([c.__dict__ for c in cites[:80]]), use_container_width=True)
-    st.markdown("#### Sample parsed references (first 80)")
-    st.dataframe(pd.DataFrame([r.__dict__ for r in refs[:80]]), use_container_width=True)
+    st.markdown("#### Sample extracted in-text citations (first 120)")
+    st.dataframe(pd.DataFrame([c.__dict__ for c in cites[:120]]), use_container_width=True)
+    st.markdown("#### Sample parsed references (first 120)")
+    st.dataframe(pd.DataFrame([r.__dict__ for r in refs[:120]]), use_container_width=True)
