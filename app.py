@@ -541,9 +541,10 @@ def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry
             rows.append({
                 "in_text": c.raw,
                 "status": f"ambiguous ({len(hits)})",
-                "matched_reference": " || ".join(h.raw[:220] for h in hits),
+                "matched_reference": " || ".join(h.raw[:200] for h in hits),
             })
-    df_c2r = ensure_columns(pd.DataFrame(rows), ["in_text", "status", "matched_reference"])
+
+    df_c2r = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["in_text", "status", "matched_reference"])
 
     cite_group = defaultdict(list)
     for c in cites:
@@ -554,13 +555,19 @@ def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry
         cited_by = cite_group.get(r.key, [])
         ref_rows.append({
             "reference": r.raw,
-            "times_cited": int(len(cited_by)),
+            "times_cited": len(cited_by),
             "cited_by": "; ".join(cited_by[:12]) + (" ..." if len(cited_by) > 12 else ""),
         })
 
-    df_r2c = ensure_columns(pd.DataFrame(ref_rows), ["reference", "times_cited", "cited_by"])
-    df_r2c = safe_sort(df_r2c, ["times_cited"], ascending=False)
+    if ref_rows:
+        df_r2c = pd.DataFrame(ref_rows)
+        if "times_cited" in df_r2c.columns:
+            df_r2c = df_r2c.sort_values(["times_cited"], ascending=False)
+    else:
+        df_r2c = pd.DataFrame(columns=["reference", "times_cited", "cited_by"])
+
     return df_c2r, df_r2c
+
 
 def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     ref_by_key = {r.key: r for r in refs}
@@ -572,7 +579,8 @@ def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -
             rows.append({"in_text": c.raw, "status": "not_found", "matched_reference": ""})
         else:
             rows.append({"in_text": c.raw, "status": "matched", "matched_reference": r.raw})
-    df_c2r = ensure_columns(pd.DataFrame(rows), ["in_text", "status", "matched_reference"])
+
+    df_c2r = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["in_text", "status", "matched_reference"])
 
     cite_group = defaultdict(list)
     for c in cites:
@@ -583,13 +591,19 @@ def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -
         cited_by = cite_group.get(r.key, [])
         ref_rows.append({
             "reference": r.raw,
-            "times_cited": int(len(cited_by)),
+            "times_cited": len(cited_by),
             "cited_by": "; ".join(cited_by[:18]) + (" ..." if len(cited_by) > 18 else ""),
         })
 
-    df_r2c = ensure_columns(pd.DataFrame(ref_rows), ["reference", "times_cited", "cited_by"])
-    df_r2c = safe_sort(df_r2c, ["times_cited"], ascending=False)
+    if ref_rows:
+        df_r2c = pd.DataFrame(ref_rows)
+        if "times_cited" in df_r2c.columns:
+            df_r2c = df_r2c.sort_values(["times_cited"], ascending=False)
+    else:
+        df_r2c = pd.DataFrame(columns=["reference", "times_cited", "cited_by"])
+
     return df_c2r, df_r2c
+
 
 
 # ============================
@@ -1220,3 +1234,4 @@ with st.expander("Diagnostics"):
     if enable_verify and not df_verify.empty:
         st.markdown("#### Sample verification output (first 60)")
         st_df(df_verify.head(60), height=360)
+
