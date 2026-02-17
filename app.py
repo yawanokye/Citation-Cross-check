@@ -1,494 +1,472 @@
 # app.py
-# Citation Crosschecker (APA/Harvard + Vancouver)
-# - Robust in-text citation capture (keeps full raw strings like "(Alagidede, Tweneboah, & Adam, 2008)")
-# - Better reference entry detection from DOCX (References section parsing)
-# - Matching that tolerates "&" vs "and", commas around ampersand, and multi-author variants
-# - Reconciliation tables: in-text → reference, and reference → cited by
+# Citation Crosschecker (APA/Harvard + IEEE + Vancouver)
+# Fixes:
+# 1) Shows uncited reference COUNT + full list (and downloads)
+# 2) Adds IEEE numeric style ( [1] ) properly
+# 3) Keeps FULL in-text citations (e.g., "(Alagidede, Tweneboah, & Adam, 2008)")
+# 4) Stops treating sentences as citations
+# 5) Stops treating bare years like "(1991)" as citations
 
 import re
 import io
 import unicodedata
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Iterable
+from typing import List, Dict, Tuple, Optional
 from collections import defaultdict, Counter
 
 import streamlit as st
 import pandas as pd
 
 # ----------------------------
-# Optional PDF support
-# ----------------------------
-PDF_OK = False
-try:
-    import pdfplumber  # type: ignore
-    PDF_OK = True
-except Exception:
-    PDF_OK = False
-
-# ----------------------------
-# Optional DOCX support
+# Optional dependencies
 # ----------------------------
 DOCX_OK = False
 try:
-    from docx import Document  # type: ignore
+    from docx import Document  # python-docx
     DOCX_OK = True
 except Exception:
     DOCX_OK = False
 
+PDF_OK = False
+try:
+    import pdfplumber
+    PDF_OK = True
+except Exception:
+    PDF_OK = False
+
 
 # ============================
-# Data models
+# Constants
 # ============================
-@dataclass(frozen=True)
+YEAR = r"(?:1[6-9]\d{2}|20\d{2})(?:[a-z])?"
+YEAR_RE = re.compile(rf"\b({YEAR})\b")
+
+REF_HEADINGS = [
+    r"^\s*references?\s*(?:list)?\s*$",
+    r"^\s*bibliograph(?:y|ies)\s*$",
+    r"^\s*works\s+cited\s*$",
+    r"^\s*literature\s+cited\s*$",
+]
+
+# Common non-citation parentheticals to ignore
+NONCITE_LEADS = {
+    "e.g", "i.e", "see", "cf", "for example", "for instance",
+    "chapter", "section", "table", "figure", "eq", "equation",
+}
+
+# If narrative capture grabs long phrases, reject unless it looks like names/org
+BAD_NARRATIVE_PREFIX_WORDS = {
+    "traditional", "classical", "analytical", "for", "from", "in", "on", "at", "by",
+    "methods", "method", "approach", "approaches", "sample", "size", "power",
+}
+
+ORG_ALIASES = {
+    "who": ["who", "world health organization", "world health organisation"],
+    "un": ["un", "united nations", "u.n.", "united nations organisation", "united nations organization"],
+    "oecd": ["oecd", "organisation for economic co-operation and development", "organization for economic cooperation and development"],
+    "imf": ["imf", "international monetary fund"],
+    "world bank": ["world bank", "international bank for reconstruction and development", "ibrd"],
+    "unesco": ["unesco", "united nations educational, scientific and cultural organization", "united nations educational scientific and cultural organization"],
+    "unicef": ["unicef", "united nations children's fund", "united nations childrens fund"],
+}
+
+ORG_ACRONYMS = {k.upper() for k in ["WHO", "UN", "OECD", "IMF", "UNESCO", "UNICEF", "WORLD BANK", "IBRD"]}
+
+
+# ============================
+# Data classes
+# ============================
+@dataclass
 class InTextCitation:
-    raw: str
-    year: str
-    surnames: Tuple[str, ...]  # cleaned tokens
-    key_primary: str
-    key_variants: Tuple[str, ...]  # keys to try (au3->au2->au, etc.)
+    style: str                  # "author-year" or "numeric"
+    raw: str                    # full raw in-text cite
+    key: str                    # matching key
+    year: Optional[str] = None
+    surnames: Optional[Tuple[str, ...]] = None
+    number: Optional[int] = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class ReferenceEntry:
     raw: str
-    year: str
-    surnames: Tuple[str, ...]
-    key_primary: str
-    key_variants: Tuple[str, ...]
+    key: str
+    year: Optional[str] = None
+    surnames: Optional[Tuple[str, ...]] = None
+    number: Optional[int] = None
 
 
 # ============================
 # Normalisation helpers
 # ============================
-YEAR_RE = re.compile(r"\b(1[6-9]\d{2}|20\d{2})([a-z])?\b")  # allow 1600s in rare cases, plus 2000s + suffix
-HEADING_RE = re.compile(r"^\s*(references|reference|bibliography|works cited)\s*$", re.I)
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 def _strip_accents(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     return "".join(ch for ch in s if not unicodedata.combining(ch))
 
-def norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
-
-def norm_punct(s: str) -> str:
-    # Keep apostrophes/hyphens in surnames, normalise quotes, remove most other punctuation
-    s = (s or "")
-    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+def norm_token(s: str) -> str:
+    s = (s or "").replace("’", "'")
     s = _strip_accents(s)
-    s = s.lower()
-    s = s.replace("&", " and ")
-    s = re.sub(r"[\(\)\[\]\{\}]", " ", s)
-    s = re.sub(r"[,:;.!?]", " ", s)
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\-\s'&\.]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def titleish(s: str) -> str:
-    s = norm_space(s)
-    if not s:
-        return s
-    return s[0].upper() + s[1:]
+def canon_org(name: str) -> str:
+    n = norm_token(name)
+    for canon, variants in ORG_ALIASES.items():
+        for v in variants:
+            if n == norm_token(v):
+                return canon
+    return n
 
-def clean_author_token(s: str) -> str:
-    # For surnames/org tokens used in keys
-    s = norm_punct(s)
-    # Drop common fillers
-    drop = {"et", "al", "al.", "and"}
-    parts = [p for p in s.split() if p and p not in drop]
-    if not parts:
-        return ""
-    # If it's an organisation, keep first 2 words as a stable token
-    if len(parts) >= 2 and (parts[0] in {"world", "international", "united"}):
-        return (parts[0] + "_" + parts[1]).strip("_")
-    # Else keep the last token (typical surname behaviour)
-    return parts[-1]
+def is_known_org(text: str) -> bool:
+    t = (text or "").strip()
+    if t.upper() in ORG_ACRONYMS:
+        return True
+    c = canon_org(t)
+    return c in ORG_ALIASES.keys()
 
-def key_author_year_surnames(surnames: Iterable[str], year: str) -> Tuple[str, Tuple[str, ...]]:
-    """
-    Builds a primary key and variants.
-    - primary = au_<a1>_<year>
-    - variants include au2_, au3_ when possible, and always include au_ fallback
-    """
-    y = norm_space(year)
-    ss = [clean_author_token(x) for x in surnames if clean_author_token(x)]
-    ss = [x for x in ss if x]
-    if not ss:
-        primary = f"au_unknown_{y}"
-        return primary, (primary,)
+def looks_like_surname(tok: str) -> bool:
+    # A conservative surname detector to avoid capturing random words
+    if not tok:
+        return False
+    t = tok.strip()
+    if len(t) < 2:
+        return False
+    if not re.fullmatch(r"[A-Z][A-Za-z\-']{1,40}", t):
+        return False
+    # Reject if it's a common narrative word
+    if norm_token(t) in BAD_NARRATIVE_PREFIX_WORDS:
+        return False
+    return True
 
-    a1 = ss[0]
-    variants = []
+def clean_surname(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace("&", " and ")
+    s = re.sub(r"\bet\s+al\.?\b", "", s, flags=re.I)
+    s = re.sub(r"[^A-Za-z\-'\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Take last token as surname-ish
+    parts = s.split()
+    return parts[-1] if parts else ""
 
-    # Most specific first
-    if len(ss) >= 3:
-        variants.append(f"au3_{ss[0]}_{ss[1]}_{ss[2]}_{y}")
-    if len(ss) >= 2:
-        variants.append(f"au2_{ss[0]}_{ss[1]}_{y}")
-    variants.append(f"au_{a1}_{y}")
+def key_author_year(first_surname: str, year: str) -> str:
+    return f"au_{norm_token(first_surname)}_{(year or '').lower()}"
 
-    primary = f"au_{a1}_{y}"
-    # De-dup while keeping order
-    seen = set()
-    ordered = []
-    for k in variants:
-        if k not in seen:
-            ordered.append(k)
-            seen.add(k)
-    return primary, tuple(ordered)
+def key_numeric(n: int) -> str:
+    return f"n_{int(n)}"
+
+def is_bare_year_parenthetical(raw_inside: str) -> bool:
+    s = norm_space(raw_inside)
+    # only a year (maybe suffixed), optionally with page/pp is still not a citation
+    return bool(re.fullmatch(rf"{YEAR}", s))
+
+def split_semicolons(block: str) -> List[str]:
+    parts = [p.strip() for p in (block or "").split(";") if p.strip()]
+    return parts if parts else [block.strip()]
 
 
 # ============================
-# DOCX / PDF text extraction
+# File readers
 # ============================
-def read_docx_text_and_refs(file_bytes: bytes) -> Tuple[str, List[str]]:
+def read_docx_paragraphs(file_bytes: bytes) -> List[str]:
     if not DOCX_OK:
-        raise RuntimeError("python-docx is not installed. Add 'python-docx' to requirements.txt.")
-
+        raise RuntimeError("python-docx not installed")
     doc = Document(io.BytesIO(file_bytes))
     paras = [norm_space(p.text) for p in doc.paragraphs]
-    # Remove totally empty
-    paras2 = [p for p in paras if p]
+    return [p for p in paras if p]
 
-    # Detect References heading, then treat subsequent paragraphs as reference entries
-    ref_start_idx = None
-    for i, p in enumerate(paras2):
-        if HEADING_RE.match(p):
-            ref_start_idx = i
+def read_pdf_text(file_bytes: bytes) -> str:
+    if not PDF_OK:
+        raise RuntimeError("pdfplumber not installed")
+    out = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for p in pdf.pages:
+            out.append(p.extract_text() or "")
+    return "\n".join(out)
+
+def split_main_and_references_from_docx(paras: List[str]) -> Tuple[str, List[str], str]:
+    heading_idx = None
+    heading_line = ""
+    for i, line in enumerate(paras):
+        s = line.strip()
+        for pat in REF_HEADINGS:
+            if re.search(pat, s, flags=re.I):
+                heading_idx = i
+                heading_line = s
+                break
+        if heading_idx is not None:
             break
 
-    if ref_start_idx is None:
-        # No explicit References heading, return full text and empty refs
-        full_text = "\n".join(paras2)
-        return full_text, []
+    if heading_idx is None:
+        return "\n".join(paras), [], "No References heading found in DOCX."
 
-    main_text = "\n".join(paras2[:ref_start_idx])
-    ref_block = paras2[ref_start_idx + 1 :]
+    main = "\n".join(paras[:heading_idx]).strip()
+    refs_paras = paras[heading_idx + 1 :]
 
-    # Reference entries are usually one per paragraph in DOCX.
-    # Merge continuation lines that look like they belong to previous ref (starts lowercase or digit)
+    # Merge continuation paragraphs that look like they continue the previous reference
     refs: List[str] = []
     buf = ""
-    for p in ref_block:
+    for p in refs_paras:
         if not buf:
             buf = p
             continue
-        starts_like_continuation = bool(re.match(r"^\s*(\(|\d+\.|[a-z])", p))
-        if starts_like_continuation:
-            buf = buf + " " + p
+        # continuation if starts lowercase or starts with a digit or '('
+        if re.match(r"^\s*([a-z]|\d|\()", p):
+            buf = (buf + " " + p).strip()
         else:
             refs.append(buf.strip())
             buf = p
     if buf:
         refs.append(buf.strip())
 
-    # Filter out obvious non-refs (short headings)
-    refs = [r for r in refs if len(r) >= 15 and not HEADING_RE.match(r)]
-    return main_text, refs
-
-
-def read_pdf_text(file_bytes: bytes) -> str:
-    if not PDF_OK:
-        raise RuntimeError("pdfplumber is not installed. Add 'pdfplumber' to requirements.txt.")
-    text_parts = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            if t.strip():
-                text_parts.append(t)
-    return "\n".join(text_parts)
+    refs = [r for r in refs if len(r) >= 10]
+    return main, refs, f"Found heading: {heading_line}"
 
 
 # ============================
 # Reference parsing
 # ============================
-def parse_reference_entry_apa(raw_ref: str) -> Optional[ReferenceEntry]:
-    r = norm_space(raw_ref)
+def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
+    r = (ref_raw or "").strip()
     if not r:
         return None
 
-    # Find (YEAR) first
-    m = re.search(r"\(\s*((?:1[6-9]\d{2}|20\d{2})(?:[a-z])?)\s*\)", r)
+    # Find year in parentheses first, common APA
+    m = re.search(rf"\(\s*({YEAR})\s*\)", r)
     if not m:
-        return None
-    year = m.group(1)
-
-    pre = r[: m.start()].strip()
-
-    # Organisation style: no commas, ends with period
-    # Person style: "Surname, I., Surname2, I., & Surname3, I."
-    surnames: List[str] = []
-
-    if "," in pre:
-        # Extract surnames as tokens before commas in author chunks.
-        # Split on '&' and 'and' and also handle multiple authors separated by '.,'
-        pre2 = pre.replace("&", " and ")
-        # Break into author chunks using " and " as separator
-        chunks = [c.strip() for c in re.split(r"\s+and\s+", pre2) if c.strip()]
-        for ch in chunks:
-            # Many refs have "Surname, X. Y."
-            # Keep the first token before the first comma as surname.
-            parts = [p.strip() for p in ch.split(",") if p.strip()]
-            if parts:
-                surnames.append(parts[0])
+        # Harvard-like: year without parentheses
+        m2 = re.search(rf"\b({YEAR})\b", r)
+        if not m2:
+            return None
+        year = m2.group(1)
+        pre = r[: m2.start()].strip()
     else:
-        # Organisation name: take first ~6 words
-        org = re.split(r"\.", pre)[0].strip()
-        if org:
-            surnames.append(org)
+        year = m.group(1)
+        pre = r[: m.start()].strip()
 
-    key_primary, key_variants = key_author_year_surnames(surnames, year)
-    return ReferenceEntry(raw=r, year=year, surnames=tuple(surnames), key_primary=key_primary, key_variants=key_variants)
+    # If org-like
+    if is_known_org(pre) or pre.upper() in ORG_ACRONYMS:
+        k = f"org_{canon_org(pre)}_{year.lower()}"
+        return ReferenceEntry(raw=r, key=k, year=year, surnames=(pre,), number=None)
 
+    # Person-like: take first surname before first comma
+    if "," in pre:
+        first = pre.split(",")[0].strip()
+    else:
+        # rare: "Mundell 1961" style
+        first = pre.split()[0].strip() if pre.split() else ""
 
-def parse_reference_entries_apa(ref_lines: List[str]) -> List[ReferenceEntry]:
-    out = []
-    for raw in ref_lines:
-        ent = parse_reference_entry_apa(raw)
-        if ent:
-            out.append(ent)
-    return out
-
-
-# ============================
-# In-text citation parsing (APA/Harvard)
-# ============================
-def _split_multi_cites_inside_parentheses(s: str) -> List[str]:
-    # Separate multiple citations in one parenthetical: "(A, 2010; B & C, 2012)"
-    # Keep semicolon separation primarily
-    parts = [p.strip() for p in s.split(";") if p.strip()]
-    return parts if parts else [s.strip()]
-
-def _extract_year(text: str) -> Optional[str]:
-    m = YEAR_RE.search(text)
-    if not m:
+    if not first:
         return None
-    return (m.group(1) + (m.group(2) or "")).strip()
 
-def _extract_authors_from_cite_chunk(chunk: str) -> List[str]:
-    """
-    chunk examples:
-      "Alagidede, Tweneboah, & Adam, 2008"
-      "Kofi et al., 2020"
-      "World Health Organization, 2019"
-      "Mundell, 1961"
-    """
-    c = norm_space(chunk)
-    # Remove leading/trailing parentheses
-    c = c.strip("()[]{} ")
-    # Remove year and any locator after year
-    # keep only part before the year
-    y = _extract_year(c)
-    if not y:
-        return []
-    pre = c.split(y)[0].strip()
-    # remove trailing punctuation/comma
-    pre = pre.rstrip(",").strip()
+    k = key_author_year(first, year)
+    return ReferenceEntry(raw=r, key=k, year=year, surnames=(first,), number=None)
 
-    # Replace ampersand to unify
-    pre = pre.replace("&", " and ")
-    # Remove "see" and similar leading words
-    pre = re.sub(r"^(see|e\.g\.|for example)\s+", "", pre, flags=re.I).strip()
+def parse_reference_numeric(ref_raw: str) -> Optional[ReferenceEntry]:
+    r = (ref_raw or "").strip()
+    if not r:
+        return None
 
-    # If "et al." is used, keep only first author token before it
-    if re.search(r"\bet\s+al\.?\b", pre, flags=re.I):
-        first = re.split(r"\bet\s+al\.?\b", pre, flags=re.I)[0].strip().rstrip(",")
-        # first might be "Kofi" or "Kofi," etc.
-        if first:
-            # If it is "Surname," keep just before comma
-            if "," in first:
-                first = first.split(",")[0].strip()
-            return [first]
+    # [12] ...
+    m = re.match(r"^\s*\[\s*(\d+)\s*\]\s*(.+)$", r)
+    if m:
+        n = int(m.group(1))
+        return ReferenceEntry(raw=r, key=key_numeric(n), number=n)
 
-    # Split authors by commas and "and"
-    # For APA in-text, multiple authors often written "A, B, & C" where commas separate surnames
-    pieces = [p.strip() for p in re.split(r"\s+and\s+|,", pre) if p.strip()]
+    # 12. ... or 12) ...
+    m = re.match(r"^\s*(\d+)\s*[\.\)]\s*(.+)$", r)
+    if m:
+        n = int(m.group(1))
+        return ReferenceEntry(raw=r, key=key_numeric(n), number=n)
 
-    # Filter out initials-only fragments
-    cleaned = []
-    for p in pieces:
-        # drop single-letter initials
-        if re.fullmatch(r"[A-Z]\.?", p):
+    # loose: "12 Author ..."
+    m = re.match(r"^\s*(\d+)\s+(.+)$", r)
+    if m:
+        n = int(m.group(1))
+        return ReferenceEntry(raw=r, key=key_numeric(n), number=n)
+
+    return None
+
+
+# ============================
+# In-text extraction (APA/Harvard)
+# ============================
+def extract_author_year_citations(text: str) -> List[InTextCitation]:
+    out: List[InTextCitation] = []
+    txt = text or ""
+
+    # --- Parenthetical blocks that contain a year ---
+    # We will only accept chunks that look like "Surname..., 2008" or "Org..., 2008"
+    paren_blocks = re.finditer(rf"\(([^()]*\b{YEAR}\b[^()]*)\)", txt)
+    for m in paren_blocks:
+        inside = m.group(1).strip()
+
+        # Reject bare years like "(1991)"
+        if is_bare_year_parenthetical(inside):
             continue
-        cleaned.append(p)
-    return cleaned
 
-
-def parse_in_text_citations_apa(full_text: str) -> List[InTextCitation]:
-    text = full_text
-
-    cites: List[InTextCitation] = []
-
-    # 1) Parenthetical citations: (...) containing a year
-    # Grab parenthetical groups that contain a year-like pattern
-    for m in re.finditer(r"\(([^()]{0,300}?\b(?:1[6-9]\d{2}|20\d{2})[a-z]?\b[^()]*)\)", text):
-        inside = m.group(1)
-        for chunk in _split_multi_cites_inside_parentheses(inside):
-            y = _extract_year(chunk)
-            if not y:
+        for chunk in split_semicolons(inside):
+            c = chunk.strip()
+            y_m = YEAR_RE.search(c)
+            if not y_m:
                 continue
-            authors = _extract_authors_from_cite_chunk(chunk)
-            key_primary, key_variants = key_author_year_surnames(authors, y)
-            raw_full = "(" + norm_space(chunk) + ")"
-            cites.append(
-                InTextCitation(
-                    raw=raw_full,
-                    year=y,
-                    surnames=tuple(authors),
-                    key_primary=key_primary,
-                    key_variants=key_variants,
-                )
-            )
+            y = y_m.group(1)
 
-    # 2) Narrative citations: Author ... (YEAR)
-    # Examples:
-    #   Alagidede, Tweneboah, & Adam (2008)
-    #   Mundell (1961)
-    #   Zehirun et al. (2016)
-    # Capture up to 120 chars before (YEAR), but stop at sentence breaks/newlines
-    for m in re.finditer(r"(?<!\()([^\n\.]{1,120}?)\(\s*((?:1[6-9]\d{2}|20\d{2})(?:[a-z])?)\s*\)", text):
-        left = norm_space(m.group(1))
-        y = m.group(2)
-        # Avoid catching things like "Figure 2 (2019)" by requiring at least one letter and not starting with "figure/table/section"
-        if re.match(r"^(figure|table|section|appendix)\b", left, flags=re.I):
-            continue
-        if not re.search(r"[A-Za-z]", left):
-            continue
+            # left side before year, must contain something author-ish
+            left = c[: y_m.start()].strip().rstrip(",").strip()
+            left_norm = norm_token(left)
+            if left_norm in NONCITE_LEADS:
+                continue
 
-        # Take only the author-ish tail: last ~80 chars
-        authorish = left[-80:].strip()
-        # Remove leading connectors like "by", "in", "see", "as"
-        authorish = re.sub(r"^(by|in|see|as)\s+", "", authorish, flags=re.I).strip()
-        # Remove trailing possessives/verbs fragments
-        authorish = re.sub(r"\b(argues|shows|finds|notes|suggests|proposes)\b.*$", "", authorish, flags=re.I).strip()
+            # Handle org
+            if is_known_org(left) and not re.search(r"\b[A-Z][a-z]+\b", left) is None:
+                k = f"org_{canon_org(left)}_{y.lower()}"
+                out.append(InTextCitation("author-year", f"({norm_space(c)})", k, year=y, surnames=(left,)))
+                continue
+            if is_known_org(left):
+                k = f"org_{canon_org(left)}_{y.lower()}"
+                out.append(InTextCitation("author-year", f"({norm_space(c)})", k, year=y, surnames=(left,)))
+                continue
 
-        authors = _extract_authors_from_cite_chunk(authorish + ", " + y)
-        if not authors:
-            continue
-        key_primary, key_variants = key_author_year_surnames(authors, y)
-        raw_full = f"{authorish} ({y})"
-        cites.append(
-            InTextCitation(
-                raw=norm_space(raw_full),
-                year=y,
-                surnames=tuple(authors),
-                key_primary=key_primary,
-                key_variants=key_variants,
-            )
+            # Handle et al.
+            if re.search(r"\bet\s+al\.?\b", left, flags=re.I):
+                first = clean_surname(left)
+                if looks_like_surname(first):
+                    k = key_author_year(first, y)
+                    out.append(InTextCitation("author-year", f"({norm_space(c)})", k, year=y, surnames=(first,)))
+                continue
+
+            # Multi-author: split on &/and and commas, keep surname-like tokens (Titlecase)
+            left2 = left.replace("&", " and ")
+            toks = [t.strip() for t in re.split(r"\s+and\s+|,", left2) if t.strip()]
+            # Keep only titlecase tokens
+            cand = [t for t in toks if looks_like_surname(t)]
+            if not cand:
+                # If nothing surname-like, skip (prevents sentences from being counted)
+                continue
+
+            first = cand[0]
+            k = key_author_year(first, y)
+            out.append(InTextCitation("author-year", f"({norm_space(c)})", k, year=y, surnames=tuple(cand)))
+
+    # --- Narrative citations: "Surname ... (2008)" or "Org (2008)" ---
+    narr_people = re.finditer(
+        rf"""
+        \b
+        (?P<author>
+            [A-Z][A-Za-z\-']{{1,40}}
+            (?:\s+et\s+al\.)?
         )
+        \s*
+        \(\s*(?P<year>{YEAR})\s*\)
+        """,
+        txt,
+        flags=re.VERBOSE,
+    )
+    for m in narr_people:
+        au = m.group("author").strip()
+        y = m.group("year")
+        # reject if it is a generic word like "Traditional (1991)"
+        if norm_token(au) in BAD_NARRATIVE_PREFIX_WORDS:
+            continue
+        if is_known_org(au):
+            k = f"org_{canon_org(au)}_{y.lower()}"
+            out.append(InTextCitation("author-year", m.group(0), k, year=y, surnames=(au,)))
+        else:
+            first = clean_surname(au)
+            if looks_like_surname(first):
+                k = key_author_year(first, y)
+                out.append(InTextCitation("author-year", m.group(0), k, year=y, surnames=(first,)))
 
-    # De-duplicate by (raw, year) while preserving counts later via Counter on key_primary+raw
+    # De-dup by raw
     uniq = []
     seen = set()
-    for c in cites:
-        k = (c.raw, c.year)
-        if k not in seen:
+    for c in out:
+        if c.raw not in seen:
             uniq.append(c)
-            seen.add(k)
+            seen.add(c.raw)
     return uniq
 
 
 # ============================
-# Vancouver parsing (basic)
+# Numeric extraction (IEEE + Vancouver)
 # ============================
-def parse_in_text_citations_vancouver(text: str) -> List[str]:
-    # Capture [1], [1-3], [1,2,5]
-    hits = re.findall(r"\[(\s*\d+(?:\s*[-,]\s*\d+)*\s*)\]", text)
-    out = []
-    for h in hits:
-        out.append("[" + re.sub(r"\s+", "", h) + "]")
+_SUP_DIGITS = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+}
+def _sup_to_int(s: str) -> Optional[int]:
+    try:
+        digits = "".join(_SUP_DIGITS.get(ch, "") for ch in s)
+        return int(digits) if digits else None
+    except Exception:
+        return None
+
+def _expand_numeric_chunks(inside: str) -> List[int]:
+    inside = inside.replace("–", "-")
+    chunks = [c.strip() for c in inside.split(",") if c.strip()]
+    nums: List[int] = []
+    for c in chunks:
+        m = re.match(r"^(\d+)\s*-\s*(\d+)$", c)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a <= b and (b - a) <= 2000:
+                nums.extend(range(a, b + 1))
+        else:
+            if c.isdigit():
+                nums.append(int(c))
+    return nums
+
+def extract_ieee_numeric_citations(text: str) -> List[InTextCitation]:
+    out: List[InTextCitation] = []
+    # [1], [1-3], [1,2,5]
+    pat = re.compile(r"\[\s*(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\]")
+    for m in pat.finditer(text or ""):
+        raw = m.group(0)
+        inside = m.group(1)
+        for n in _expand_numeric_chunks(inside):
+            out.append(InTextCitation("numeric", raw, key_numeric(n), number=n))
     return out
 
-def parse_reference_entries_vancouver(ref_lines: List[str]) -> List[str]:
-    # Very simple: keep lines that start with a number or look like a ref
-    out = []
-    for r in ref_lines:
-        rr = norm_space(r)
-        if re.match(r"^\d+\.", rr) or re.match(r"^\d+\s", rr):
-            out.append(rr)
-        elif YEAR_RE.search(rr) and len(rr) > 25:
-            out.append(rr)
-    return out
-
-
-# ============================
-# Matching and reporting (APA/Harvard)
-# ============================
-def build_reference_index(refs: List[ReferenceEntry]) -> Dict[str, List[ReferenceEntry]]:
-    ref_by_key: Dict[str, List[ReferenceEntry]] = defaultdict(list)
-    for r in refs:
-        for k in r.key_variants:
-            ref_by_key[k].append(r)
-    return ref_by_key
-
-def best_match_for_citation(c: InTextCitation, ref_by_key: Dict[str, List[ReferenceEntry]]) -> List[ReferenceEntry]:
-    # Try variants from most specific to fallback
-    for k in c.key_variants:
-        hits = ref_by_key.get(k, [])
-        if hits:
-            return hits
-    # Special fallback: if au2_* try au_* (already included), if au3_* try au2_ then au_ (already included)
-    return []
-
-def missing_and_uncited_apa(
-    cites: List[InTextCitation], refs: List[ReferenceEntry]
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ref_by_key = build_reference_index(refs)
-
-    # Count citations by their RAW string (users care about exact in-text strings) and also keep match suggestions
-    cite_counter = Counter([c.raw for c in cites])
-
-    rows_missing = []
-    for raw_cite, cnt in cite_counter.items():
-        # Find a representative citation object for this raw cite
-        c_obj = next((c for c in cites if c.raw == raw_cite), None)
-        if not c_obj:
+def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
+    out: List[InTextCitation] = []
+    # (1), (1-3), (1,2)
+    pat = re.compile(r"\(\s*(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\)")
+    for m in pat.finditer(text or ""):
+        inside = m.group(1)
+        # avoid capturing (2008) years as vancouver
+        if re.fullmatch(rf"{YEAR}", inside.strip()):
             continue
-        hits = best_match_for_citation(c_obj, ref_by_key)
-        if not hits:
-            rows_missing.append(
-                {
-                    "citation_in_text": raw_cite,
-                    "count_in_text": cnt,
-                    "suggested_matches": "",
-                }
-            )
+        for n in _expand_numeric_chunks(inside):
+            out.append(InTextCitation("numeric", m.group(0), key_numeric(n), number=n))
 
-    df_missing = pd.DataFrame(rows_missing).sort_values(["count_in_text", "citation_in_text"], ascending=[False, True]) if rows_missing else pd.DataFrame(
-        columns=["citation_in_text", "count_in_text", "suggested_matches"]
-    )
+    # also accept [n] forms (many Vancouver manuscripts use brackets)
+    out.extend(extract_ieee_numeric_citations(text))
 
-    # Determine which references are cited (by key hits)
-    cited_ref_ids = set()
-    for c in cites:
-        hits = best_match_for_citation(c, ref_by_key)
-        for h in hits:
-            cited_ref_ids.add(id(h))
+    # superscripts
+    sup_run = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+")
+    for m in sup_run.finditer(text or ""):
+        n = _sup_to_int(m.group(0))
+        if n is not None:
+            out.append(InTextCitation("numeric", m.group(0), key_numeric(n), number=n))
 
-    rows_uncited = []
+    return out
+
+
+# ============================
+# Reconciliation
+# ============================
+def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ref_by_key = defaultdict(list)
     for r in refs:
-        if id(r) not in cited_ref_ids:
-            rows_uncited.append({"reference_full": r.raw})
-
-    df_uncited = pd.DataFrame(rows_uncited) if rows_uncited else pd.DataFrame(columns=["reference_full"])
-    return df_missing, df_uncited
-
-
-# ============================
-# Reconciliation tables (APA/Harvard)
-# ============================
-def reconcile_author_year(
-    cites: List[InTextCitation], refs: List[ReferenceEntry]
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-    - df_cite_to_ref: each in-text cite mapped to best reference (or ambiguous / not found)
-    - df_ref_to_cites: each reference mapped to citations that point to it
-    """
-    ref_by_key = build_reference_index(refs)
+        ref_by_key[r.key].append(r)
 
     rows = []
     for c in cites:
-        hits = best_match_for_citation(c, ref_by_key)
-
+        hits = ref_by_key.get(c.key, [])
         if not hits:
             rows.append({"in_text": c.raw, "status": "not_found", "matched_reference": ""})
         elif len(hits) == 1:
@@ -498,23 +476,18 @@ def reconcile_author_year(
                 {
                     "in_text": c.raw,
                     "status": f"ambiguous ({len(hits)})",
-                    "matched_reference": " || ".join(h.raw[:220] for h in hits),
+                    "matched_reference": " || ".join(h.raw[:200] for h in hits),
                 }
             )
+    df_c2r = pd.DataFrame(rows)
 
-    df_cite_to_ref = pd.DataFrame(rows)
-
-    # Reverse mapping: reference -> cited by (raw cites)
     cite_group = defaultdict(list)
     for c in cites:
-        hits = best_match_for_citation(c, ref_by_key)
-        # Attach this raw cite to every hit it maps to
-        for h in hits:
-            cite_group[id(h)].append(c.raw)
+        cite_group[c.key].append(c.raw)
 
     ref_rows = []
     for r in refs:
-        cited_by = cite_group.get(id(r), [])
+        cited_by = cite_group.get(r.key, [])
         ref_rows.append(
             {
                 "reference": r.raw,
@@ -522,9 +495,74 @@ def reconcile_author_year(
                 "cited_by": "; ".join(cited_by[:12]) + (" ..." if len(cited_by) > 12 else ""),
             }
         )
-    df_ref_to_cites = pd.DataFrame(ref_rows).sort_values(["times_cited"], ascending=False)
+    df_r2c = pd.DataFrame(ref_rows).sort_values(["times_cited"], ascending=False)
+    return df_c2r, df_r2c
 
-    return df_cite_to_ref, df_ref_to_cites
+def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ref_by_key = {r.key: r for r in refs}
+
+    rows = []
+    for c in cites:
+        r = ref_by_key.get(c.key)
+        if not r:
+            rows.append({"in_text": c.raw, "status": "not_found", "matched_reference": ""})
+        else:
+            rows.append({"in_text": c.raw, "status": "matched", "matched_reference": r.raw})
+    df_c2r = pd.DataFrame(rows)
+
+    cite_group = defaultdict(list)
+    for c in cites:
+        cite_group[c.key].append(c.raw)
+
+    ref_rows = []
+    for r in refs:
+        cited_by = cite_group.get(r.key, [])
+        ref_rows.append(
+            {
+                "reference": r.raw,
+                "times_cited": len(cited_by),
+                "cited_by": "; ".join(cited_by[:18]) + (" ..." if len(cited_by) > 18 else ""),
+            }
+        )
+    df_r2c = pd.DataFrame(ref_rows).sort_values(["times_cited"], ascending=False)
+    return df_c2r, df_r2c
+
+
+# ============================
+# Missing + Uncited reports (accurate + full raw)
+# ============================
+def build_missing_uncited(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+    cite_keys = [c.key for c in cites]
+    ref_keys = [r.key for r in refs]
+
+    cite_count_by_raw = Counter([c.raw for c in cites])
+    cite_key_by_raw = {}
+    for c in cites:
+        cite_key_by_raw.setdefault(c.raw, c.key)
+
+    missing_rows = []
+    ref_key_set = set(ref_keys)
+    for raw, cnt in cite_count_by_raw.items():
+        k = cite_key_by_raw.get(raw, "")
+        if k and (k not in ref_key_set):
+            missing_rows.append({"citation_in_text": raw, "count_in_text": cnt})
+
+    df_missing = pd.DataFrame(missing_rows).sort_values(["count_in_text", "citation_in_text"], ascending=[False, True]) if missing_rows else pd.DataFrame(
+        columns=["citation_in_text", "count_in_text"]
+    )
+
+    # Uncited references: those with keys never matched by any cite key
+    cite_key_set = set(cite_keys)
+    uncited_rows = [{"reference_full": r.raw} for r in refs if r.key not in cite_key_set]
+    df_uncited = pd.DataFrame(uncited_rows) if uncited_rows else pd.DataFrame(columns=["reference_full"])
+
+    summary = {
+        "in_text_citations_found": len(cites),
+        "reference_entries_found": len(refs),
+        "missing_in_references": len(df_missing),
+        "uncited_references": len(df_uncited),
+    }
+    return df_missing, df_uncited, summary
 
 
 # ============================
@@ -532,95 +570,129 @@ def reconcile_author_year(
 # ============================
 st.set_page_config(page_title="Citation Crosschecker", layout="wide")
 st.title("Citation Crosschecker")
-st.caption("Checks in-text citations against reference entries. Best results with APA/Harvard and Vancouver styles.")
 
-with st.sidebar:
-    st.header("Settings")
+st.markdown(
+    """
+<div style="margin-top:6px; margin-bottom:10px; padding:10px 12px; border:1px solid #e6e6e6; border-radius:10px;">
+  <div style="font-size:13px; font-weight:600;">© Prof. Anokye M. Adam</div>
+  <div style="font-size:12px; margin-top:6px; line-height:1.35;">
+    Disclaimer: This tool can make mistakes. Verify results against your manuscript and style guide before submission.
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+col1, col2 = st.columns([1, 1])
+with col1:
+    uploaded = st.file_uploader("Upload DOCX or PDF", type=["docx", "pdf"])
+with col2:
     style = st.selectbox(
         "Citation style",
-        ["APA/Harvard (author–year)", "Vancouver (numeric)"],
+        ["APA/Harvard (author–year)", "IEEE (numeric [1])", "Vancouver (numeric (1)/superscript)"],
         index=0,
     )
-    st.write("")
-    st.subheader("Upload")
-    up = st.file_uploader("Upload a manuscript (DOCX or PDF)", type=["docx", "pdf"])
 
-if not up:
-    st.info("Upload a DOCX (recommended) or PDF to begin.")
+if uploaded is None:
+    st.info("Upload a DOCX or PDF to begin.")
     st.stop()
 
-file_bytes = up.read()
-file_name = up.name.lower()
+file_bytes = uploaded.read()
+name = uploaded.name.lower()
 
-# Extract text + refs
+# Extract text + references
 main_text = ""
 ref_lines: List[str] = []
+ref_msg = ""
 
 try:
-    if file_name.endswith(".docx"):
-        main_text, ref_lines = read_docx_text_and_refs(file_bytes)
-    elif file_name.endswith(".pdf"):
-        # PDF: we can extract text, but references section splitting is harder.
-        # We'll still attempt: look for a "References" heading inside text.
+    if name.endswith(".docx"):
+        paras = read_docx_paragraphs(file_bytes)
+        main_text, ref_lines, ref_msg = split_main_and_references_from_docx(paras)
+    else:
         full = read_pdf_text(file_bytes)
-        # crude split on References heading
-        chunks = re.split(r"\n\s*(references|bibliography|works cited)\s*\n", full, flags=re.I)
-        if len(chunks) >= 3:
-            main_text = chunks[0]
-            ref_block = "\n".join(chunks[2:])
-            # split references by line breaks, then merge lightly
-            raw_lines = [norm_space(x) for x in ref_block.split("\n") if norm_space(x)]
-            # merge continuation lines
+        # Best effort split: look for a References heading line
+        lines = full.splitlines()
+        idx = None
+        for i, ln in enumerate(lines):
+            s = ln.strip()
+            if any(re.search(p, s, flags=re.I) for p in REF_HEADINGS):
+                idx = i
+                ref_msg = f"Found heading: {s}"
+                break
+        if idx is None:
+            main_text = full
+            ref_lines = []
+            ref_msg = "No References heading found in PDF. (PDF extraction is less reliable.)"
+        else:
+            main_text = "\n".join(lines[:idx]).strip()
+            ref_block = "\n".join(lines[idx + 1 :]).strip()
+            # Split refs by blank lines or numbering starts
+            raw_lines = [ln.strip() for ln in ref_block.splitlines() if ln.strip()]
             merged = []
             buf = ""
             for ln in raw_lines:
                 if not buf:
                     buf = ln
                     continue
-                if re.match(r"^\(?\d+\)?[.\)]?\s", ln) or YEAR_RE.search(ln):
+                if re.match(r"^\s*(\[\d+\]|\d+[\.\)]|\d+\s)", ln):
                     merged.append(buf)
                     buf = ln
                 else:
-                    buf = buf + " " + ln
+                    buf = (buf + " " + ln).strip()
             if buf:
                 merged.append(buf)
             ref_lines = merged
-        else:
-            main_text = full
-            ref_lines = []
-    else:
-        st.error("Unsupported file type.")
-        st.stop()
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
 
+st.subheader("References detection")
+st.write(ref_msg)
+
+if not ref_lines:
+    st.warning("References section looks empty or not detected. Add a 'References' heading in the DOCX for best results.")
+    with st.expander("Paste References manually (optional)"):
+        pasted_refs = st.text_area("Paste your References section here", height=220)
+        if pasted_refs.strip():
+            ref_lines = [x.strip() for x in pasted_refs.splitlines() if x.strip()]
+
+st.caption(f"Main text length: {len(main_text):,} chars | Reference lines: {len(ref_lines):,}")
+
+with st.expander("Preview detected References (first 50)"):
+    st.write("\n\n".join(ref_lines[:50]) if ref_lines else "No references detected.")
+
+# Parse cites + refs based on style
 if style.startswith("APA/Harvard"):
-    cites = parse_in_text_citations_apa(main_text)
-    refs = parse_reference_entries_apa(ref_lines)
+    cites = extract_author_year_citations(main_text)
+    refs = [parse_reference_author_year(r) for r in ref_lines]
+    refs = [r for r in refs if r is not None]
+elif style.startswith("IEEE"):
+    cites = extract_ieee_numeric_citations(main_text)
+    refs = [parse_reference_numeric(r) for r in ref_lines]
+    refs = [r for r in refs if r is not None]
+else:
+    cites = extract_vancouver_numeric_citations(main_text)
+    refs = [parse_reference_numeric(r) for r in ref_lines]
+    refs = [r for r in refs if r is not None]
 
-    # Summary
-    col1, col2, col3 = st.columns(3)
-    col1.metric("In-text citations found", len(cites))
-    col2.metric("Reference entries found", len(refs))
-    col3.metric("References heading detected", "Yes" if ref_lines else "No / uncertain")
+# Summary + Missing/Uncited
+df_missing, df_uncited, summary = build_missing_uncited(cites, refs)
 
-    if not ref_lines:
-        st.warning(
-            "I could not confidently locate a References section. In DOCX, add a heading like 'References'. "
-            "In PDF, extraction is more fragile."
-        )
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("In-text citations", summary["in_text_citations_found"])
+m2.metric("Reference entries", summary["reference_entries_found"])
+m3.metric("Missing", summary["missing_in_references"])
+m4.metric("Uncited", summary["uncited_references"])
 
-    # Missing / Uncited
-    st.divider()
-    st.subheader("Cross-check results")
+st.divider()
+c1, c2 = st.columns(2)
 
-    df_missing, df_uncited = missing_and_uncited_apa(cites, refs)
-
-    left, right = st.columns(2)
-
-    with left:
-        st.markdown("### Cited in-text but missing in References")
+with c1:
+    st.markdown("### Cited in-text but missing in References")
+    if df_missing.empty:
+        st.success("None detected.")
+    else:
         st.dataframe(df_missing, use_container_width=True, height=420)
         st.download_button(
             "Download missing (CSV)",
@@ -629,8 +701,11 @@ if style.startswith("APA/Harvard"):
             mime="text/csv",
         )
 
-    with right:
-        st.markdown("### In References but never cited")
+with c2:
+    st.markdown("### In References but never cited (full list)")
+    if df_uncited.empty:
+        st.success("None detected.")
+    else:
         st.dataframe(df_uncited, use_container_width=True, height=420)
         st.download_button(
             "Download uncited (CSV)",
@@ -639,12 +714,17 @@ if style.startswith("APA/Harvard"):
             mime="text/csv",
         )
 
-    # Reconciliation tables
-    st.divider()
-    st.subheader("Reconciliation (which citation maps to which reference)")
+# Reconciliation tables
+st.divider()
+st.subheader("Reconciliation (maps citations to exact references)")
 
+if style.startswith("APA/Harvard"):
     df_c2r, df_r2c = reconcile_author_year(cites, refs)
+else:
+    df_c2r, df_r2c = reconcile_numeric(cites, refs)
 
+left, right = st.columns(2)
+with left:
     st.markdown("### In-text → Reference")
     st.dataframe(df_c2r, use_container_width=True, height=420)
     st.download_button(
@@ -654,6 +734,7 @@ if style.startswith("APA/Harvard"):
         mime="text/csv",
     )
 
+with right:
     st.markdown("### Reference → Cited by")
     st.dataframe(df_r2c, use_container_width=True, height=420)
     st.download_button(
@@ -663,54 +744,9 @@ if style.startswith("APA/Harvard"):
         mime="text/csv",
     )
 
-    # Diagnostics panel
-    with st.expander("Diagnostics (keys and parsing preview)"):
-        st.write("Sample parsed citations (first 20):")
-        diag_c = []
-        for c in cites[:20]:
-            diag_c.append(
-                {
-                    "raw": c.raw,
-                    "year": c.year,
-                    "surnames": ", ".join(c.surnames),
-                    "primary_key": c.key_primary,
-                    "variants": " | ".join(c.key_variants),
-                }
-            )
-        st.dataframe(pd.DataFrame(diag_c), use_container_width=True)
-
-        st.write("Sample parsed references (first 20):")
-        diag_r = []
-        for r in refs[:20]:
-            diag_r.append(
-                {
-                    "raw": r.raw[:260],
-                    "year": r.year,
-                    "surnames": ", ".join(r.surnames),
-                    "primary_key": r.key_primary,
-                    "variants": " | ".join(r.key_variants),
-                }
-            )
-        st.dataframe(pd.DataFrame(diag_r), use_container_width=True)
-
-else:
-    # Vancouver basic mode
-    cites_v = parse_in_text_citations_vancouver(main_text)
-    refs_v = parse_reference_entries_vancouver(ref_lines)
-
-    col1, col2 = st.columns(2)
-    col1.metric("In-text bracket citations found", len(cites_v))
-    col2.metric("Reference-like entries found", len(refs_v))
-
-    st.divider()
-    st.subheader("What this mode does now")
-    st.info(
-        "Vancouver support here is basic. It detects bracket citations like [1], [1-3], [2,5]. "
-        "Accurate mapping to a numbered reference list needs stricter parsing of the reference numbering."
-    )
-
-    st.markdown("### Sample in-text citations")
-    st.dataframe(pd.DataFrame({"citation_in_text": cites_v[:80]}), use_container_width=True)
-
-    st.markdown("### Sample reference entries")
-    st.dataframe(pd.DataFrame({"reference_full": refs_v[:80]}), use_container_width=True)
+# Debug tools
+with st.expander("Diagnostics"):
+    st.markdown("#### Sample extracted in-text citations (first 50)")
+    st.dataframe(pd.DataFrame([c.__dict__ for c in cites[:50]]), use_container_width=True)
+    st.markdown("#### Sample parsed references (first 50)")
+    st.dataframe(pd.DataFrame([r.__dict__ for r in refs[:50]]), use_container_width=True)
