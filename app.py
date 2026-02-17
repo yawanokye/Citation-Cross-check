@@ -1,10 +1,11 @@
 # app.py
 # Citation Crosschecker (APA/Harvard + IEEE + Vancouver) + Online verification (Crossref + OpenAlex)
-# Fixes included in this version:
-# - Replaces use_container_width with width="stretch" everywhere (Streamlit deprecation fix)
-# - Fixes KeyError: 'times_cited' by building DataFrames with fixed columns and sorting safely
-# - Keeps your narrative-citation overlap blocking and bare-year filtering
-# - Keeps full raw outputs for Missing/Uncited tables
+# Hardened production build:
+# - No crashes on empty dataframes or missing columns (fixes KeyError: 'times_cited')
+# - Streamlit width API compatible (uses width='stretch', falls back for older Streamlit)
+# - Online verification is fully guarded (offline/timeout won’t break the app)
+# - Safer parsing + better diagnostics
+# - Keeps full raw in-text citations and full reference entries in outputs
 
 import re
 import io
@@ -97,6 +98,41 @@ class ReferenceEntry:
     year: Optional[str] = None
     surnames: Optional[Tuple[str, ...]] = None
     number: Optional[int] = None
+
+
+# ============================
+# Streamlit-safe helpers
+# ============================
+def st_df(df: pd.DataFrame, height: int = 420):
+    """Streamlit dataframe that avoids breaking across Streamlit versions."""
+    if df is None:
+        df = pd.DataFrame()
+    try:
+        st.dataframe(df, width="stretch", height=height)
+    except TypeError:
+        # Older Streamlit
+        st.dataframe(df, use_container_width=True, height=height)
+
+def safe_sort(df: pd.DataFrame, by: List[str], ascending: bool | List[bool] = False) -> pd.DataFrame:
+    """Sort only if all columns exist and df is not empty."""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    for c in by:
+        if c not in df.columns:
+            return df
+    try:
+        return df.sort_values(by, ascending=ascending)
+    except Exception:
+        return df
+
+def ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """Ensure df has these columns (in this order), even if empty."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols]
 
 
 # ============================
@@ -300,12 +336,10 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
                 return True
         return False
 
-    # Parenthetical blocks that contain a year
-    paren_blocks = re.finditer(rf"\(([^()]*\b{YEAR}\b[^()]*)\)", txt)
-    for m in paren_blocks:
+    # --- Parenthetical blocks that contain a year ---
+    for m in re.finditer(rf"\(([^()]*\b{YEAR}\b[^()]*)\)", txt):
         inside = m.group(1).strip()
 
-        # Reject bare years like "(1991)"
         if is_bare_year_parenthetical(inside):
             continue
 
@@ -343,7 +377,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             k = key_author_year(first, y)
             out.append(InTextCitation("author-year", f"({norm_space(c)})", k, year=y, surnames=tuple(cand)))
 
-    # Narrative multi-author
+    # --- Multi-author narrative (blocks single-author extraction inside) ---
     narr_multi = re.finditer(
         rf"""
         \b
@@ -382,29 +416,23 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         out.append(InTextCitation("author-year", m.group(0), k, year=y, surnames=tuple(cand)))
         taken_spans.append(span)
 
-    # "et al." narrative
-    narr_etal = re.finditer(
+    # --- "et al." narrative ---
+    for m in re.finditer(
         rf"\b(?P<a>[A-Z][A-Za-z\-']{{1,40}})\s+et\s+al\.\s*\(\s*(?P<y>{YEAR})\s*\)",
         txt,
         flags=re.IGNORECASE,
-    )
-    for m in narr_etal:
+    ):
         span = (m.start(), m.end())
         if _overlaps(span, taken_spans):
             continue
-
         first = m.group("a").strip()
         y = m.group("y")
         if looks_like_surname(first):
             out.append(InTextCitation("author-year", m.group(0), key_author_year(first, y), year=y, surnames=(first,)))
             taken_spans.append(span)
 
-    # Single-author narrative
-    narr_single = re.finditer(
-        rf"\b(?P<author>[A-Z][A-Za-z\-']{{1,40}})\s*\(\s*(?P<year>{YEAR})\s*\)",
-        txt,
-    )
-    for m in narr_single:
+    # --- Single-author narrative (skip inside multi-author spans) ---
+    for m in re.finditer(rf"\b(?P<author>[A-Z][A-Za-z\-']{{1,40}})\s*\(\s*(?P<year>{YEAR})\s*\)", txt):
         span = (m.start(), m.end())
         if _overlaps(span, taken_spans):
             continue
@@ -495,14 +523,13 @@ def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
 
 
 # ============================
-# Reconciliation (SAFE)
+# Reconciliation (crash-proof)
 # ============================
 def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     ref_by_key = defaultdict(list)
     for r in refs:
         ref_by_key[r.key].append(r)
 
-    # In-text -> reference
     rows = []
     for c in cites:
         hits = ref_by_key.get(c.key, [])
@@ -514,12 +541,10 @@ def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry
             rows.append({
                 "in_text": c.raw,
                 "status": f"ambiguous ({len(hits)})",
-                "matched_reference": " || ".join(h.raw[:200] for h in hits),
+                "matched_reference": " || ".join(h.raw[:220] for h in hits),
             })
+    df_c2r = ensure_columns(pd.DataFrame(rows), ["in_text", "status", "matched_reference"])
 
-    df_c2r = pd.DataFrame(rows, columns=["in_text", "status", "matched_reference"])
-
-    # Reference -> cited by
     cite_group = defaultdict(list)
     for c in cites:
         cite_group[c.key].append(c.raw)
@@ -533,10 +558,8 @@ def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry
             "cited_by": "; ".join(cited_by[:12]) + (" ..." if len(cited_by) > 12 else ""),
         })
 
-    df_r2c = pd.DataFrame(ref_rows, columns=["reference", "times_cited", "cited_by"])
-    if not df_r2c.empty and "times_cited" in df_r2c.columns:
-        df_r2c = df_r2c.sort_values("times_cited", ascending=False)
-
+    df_r2c = ensure_columns(pd.DataFrame(ref_rows), ["reference", "times_cited", "cited_by"])
+    df_r2c = safe_sort(df_r2c, ["times_cited"], ascending=False)
     return df_c2r, df_r2c
 
 def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -549,8 +572,7 @@ def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -
             rows.append({"in_text": c.raw, "status": "not_found", "matched_reference": ""})
         else:
             rows.append({"in_text": c.raw, "status": "matched", "matched_reference": r.raw})
-
-    df_c2r = pd.DataFrame(rows, columns=["in_text", "status", "matched_reference"])
+    df_c2r = ensure_columns(pd.DataFrame(rows), ["in_text", "status", "matched_reference"])
 
     cite_group = defaultdict(list)
     for c in cites:
@@ -565,10 +587,8 @@ def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -
             "cited_by": "; ".join(cited_by[:18]) + (" ..." if len(cited_by) > 18 else ""),
         })
 
-    df_r2c = pd.DataFrame(ref_rows, columns=["reference", "times_cited", "cited_by"])
-    if not df_r2c.empty and "times_cited" in df_r2c.columns:
-        df_r2c = df_r2c.sort_values("times_cited", ascending=False)
-
+    df_r2c = ensure_columns(pd.DataFrame(ref_rows), ["reference", "times_cited", "cited_by"])
+    df_r2c = safe_sort(df_r2c, ["times_cited"], ascending=False)
     return df_c2r, df_r2c
 
 
@@ -591,16 +611,14 @@ def build_missing_uncited(cites: List[InTextCitation], refs: List[ReferenceEntry
         if k and (k not in ref_key_set):
             missing_rows.append({"citation_in_text": raw, "count_in_text": int(cnt)})
 
-    if missing_rows:
-        df_missing = pd.DataFrame(missing_rows, columns=["citation_in_text", "count_in_text"]).sort_values(
-            ["count_in_text", "citation_in_text"], ascending=[False, True]
-        )
-    else:
-        df_missing = pd.DataFrame(columns=["citation_in_text", "count_in_text"])
+    df_missing = pd.DataFrame(missing_rows)
+    df_missing = ensure_columns(df_missing, ["citation_in_text", "count_in_text"])
+    df_missing = safe_sort(df_missing, ["count_in_text", "citation_in_text"], ascending=[False, True])
 
     cite_key_set = set(cite_keys)
     uncited_rows = [{"reference_full": r.raw} for r in refs if r.key not in cite_key_set]
-    df_uncited = pd.DataFrame(uncited_rows, columns=["reference_full"]) if uncited_rows else pd.DataFrame(columns=["reference_full"])
+    df_uncited = pd.DataFrame(uncited_rows)
+    df_uncited = ensure_columns(df_uncited, ["reference_full"])
 
     summary = {
         "in_text_citations_found": int(len(cites)),
@@ -612,18 +630,18 @@ def build_missing_uncited(cites: List[InTextCitation], refs: List[ReferenceEntry
 
 
 # ============================
-# Online verification helpers
+# Online verification helpers (crash-proof)
 # ============================
 def build_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "citation-crosscheck/2.0 (streamlit)"})
+    s.headers.update({"User-Agent": "citation-crosscheck/2.1 (streamlit)"})
     return s
 
 SESSION = build_session()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=6))
 def _get_json(url: str, params: dict) -> dict:
-    r = SESSION.get(url, params=params, timeout=25)
+    r = SESSION.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -650,7 +668,7 @@ def _as_int_year(y: Optional[str]) -> Optional[int]:
     m = re.search(r"(16|17|18|19|20)\d{2}", str(y))
     return int(m.group(0)) if m else None
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=86400)
 def crossref_lookup_by_doi(doi: str) -> Optional[dict]:
     try:
         data = _get_json(f"{CROSSREF_API}/{doi}", params={})
@@ -658,15 +676,21 @@ def crossref_lookup_by_doi(doi: str) -> Optional[dict]:
     except Exception:
         return None
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=86400)
 def crossref_search(query: str, rows: int = 10) -> List[dict]:
-    data = _get_json(CROSSREF_API, params={"query.bibliographic": query, "rows": rows})
-    return data.get("message", {}).get("items", []) or []
+    try:
+        data = _get_json(CROSSREF_API, params={"query.bibliographic": query, "rows": rows})
+        return data.get("message", {}).get("items", []) or []
+    except Exception:
+        return []
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=86400)
 def openalex_search(query: str, per_page: int = 10) -> List[dict]:
-    data = _get_json(OPENALEX_API, params={"search": query, "per-page": per_page})
-    return data.get("results", []) or []
+    try:
+        data = _get_json(OPENALEX_API, params={"search": query, "per-page": per_page})
+        return data.get("results", []) or []
+    except Exception:
+        return []
 
 def crossref_item_year(it: dict) -> Optional[int]:
     for key in ["issued", "published-print", "published-online", "created"]:
@@ -741,73 +765,76 @@ def verify_reference_online(
     use_crossref: bool = True,
     use_openalex: bool = True,
 ) -> dict:
-    ref_entry = ref_obj.raw or ""
-    doi = extract_doi(ref_entry)
+    # Absolutely no exceptions escape this function
+    try:
+        ref_entry = ref_obj.raw or ""
+        doi = extract_doi(ref_entry)
 
-    ref_year = _as_int_year(ref_obj.year)
-    ref_surname = ""
-    if ref_obj.key.startswith("au_") and ref_obj.surnames:
-        ref_surname = ref_obj.surnames[0] or ""
-    who_is_org = ref_obj.key.startswith("org_")
+        ref_year = _as_int_year(ref_obj.year)
+        ref_surname = ""
+        if ref_obj.key.startswith("au_") and ref_obj.surnames:
+            ref_surname = ref_obj.surnames[0] or ""
+        who_is_org = ref_obj.key.startswith("org_")
 
-    title_snip = guess_title_snippet(ref_entry)
-    time.sleep(max(0.0, float(throttle_s or 0.0)))
+        title_snip = guess_title_snippet(ref_entry)
 
-    if doi and use_crossref:
-        cr = crossref_lookup_by_doi(doi)
-        if cr:
-            y = crossref_item_year(cr)
-            fam = crossref_first_author_family(cr)
-            title = crossref_title(cr)
+        time.sleep(max(0.0, float(throttle_s or 0.0)))
+
+        # DOI first
+        if doi and use_crossref:
+            cr = crossref_lookup_by_doi(doi)
+            if cr:
+                y = crossref_item_year(cr)
+                fam = crossref_first_author_family(cr)
+                title = crossref_title(cr)
+                return {
+                    "status": "verified",
+                    "source": "crossref_doi",
+                    "score": 100,
+                    "doi": doi,
+                    "matched_year": str(y or ""),
+                    "matched_first_author": fam,
+                    "matched_title": (title or "")[:180],
+                    "query_used": "doi_lookup",
+                    "error_crossref": "",
+                    "error_openalex": "",
+                }
             return {
-                "status": "verified",
+                "status": "not_found",
                 "source": "crossref_doi",
-                "score": 100,
+                "score": 0,
                 "doi": doi,
-                "matched_year": str(y or ""),
-                "matched_first_author": fam,
-                "matched_title": (title or "")[:180],
+                "matched_year": "",
+                "matched_first_author": "",
+                "matched_title": "",
                 "query_used": "doi_lookup",
                 "error_crossref": "",
                 "error_openalex": "",
             }
-        return {
+
+        parts = []
+        if ref_surname:
+            parts.append(ref_surname)
+        if ref_year:
+            parts.append(str(ref_year))
+        if title_snip:
+            parts.append(title_snip)
+        query = " ".join(parts).strip() or ref_entry[:200]
+
+        best = {
             "status": "not_found",
-            "source": "crossref_doi",
+            "source": "",
             "score": 0,
-            "doi": doi,
+            "doi": doi or "",
             "matched_year": "",
             "matched_first_author": "",
             "matched_title": "",
-            "query_used": "doi_lookup",
+            "query_used": query[:220],
             "error_crossref": "",
             "error_openalex": "",
         }
 
-    parts = []
-    if ref_surname:
-        parts.append(ref_surname)
-    if ref_year:
-        parts.append(str(ref_year))
-    if title_snip:
-        parts.append(title_snip)
-    query = " ".join(parts).strip() or ref_entry[:200]
-
-    best = {
-        "status": "not_found",
-        "source": "",
-        "score": 0,
-        "doi": doi or "",
-        "matched_year": "",
-        "matched_first_author": "",
-        "matched_title": "",
-        "query_used": query[:220],
-        "error_crossref": "",
-        "error_openalex": "",
-    }
-
-    if use_crossref:
-        try:
+        if use_crossref:
             items = crossref_search(query, rows=10)
             for it in items:
                 cand_year = crossref_item_year(it)
@@ -826,7 +853,6 @@ def verify_reference_online(
 
                 score = fuzz.WRatio(title_snip, cand_title) if (title_snip and cand_title) else 70
                 status = "verified" if score >= 90 else ("likely" if score >= 82 else "needs_review")
-
                 if score > best["score"]:
                     best = {
                         "status": status,
@@ -840,11 +866,8 @@ def verify_reference_online(
                         "error_crossref": "",
                         "error_openalex": best.get("error_openalex", ""),
                     }
-        except Exception as e:
-            best["error_crossref"] = str(e)[:220]
 
-    if use_openalex:
-        try:
+        if use_openalex:
             items = openalex_search(query, per_page=10)
             for it in items:
                 cand_year = openalex_year(it)
@@ -863,7 +886,6 @@ def verify_reference_online(
 
                 score = fuzz.WRatio(title_snip, cand_title) if (title_snip and cand_title) else 70
                 status = "verified" if score >= 90 else ("likely" if score >= 82 else "needs_review")
-
                 if score > best["score"]:
                     best = {
                         "status": status,
@@ -877,10 +899,22 @@ def verify_reference_online(
                         "error_crossref": best.get("error_crossref", ""),
                         "error_openalex": "",
                     }
-        except Exception as e:
-            best["error_openalex"] = str(e)[:220]
 
-    return best
+        return best
+
+    except Exception as e:
+        return {
+            "status": "offline",
+            "source": "",
+            "score": 0,
+            "doi": "",
+            "matched_year": "",
+            "matched_first_author": "",
+            "matched_title": "",
+            "query_used": "",
+            "error_crossref": str(e)[:220],
+            "error_openalex": "",
+        }
 
 
 # ============================
@@ -901,15 +935,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-col1, col2 = st.columns([1, 1])
-with col1:
+with st.sidebar:
+    st.subheader("Settings")
     uploaded = st.file_uploader("Upload DOCX or PDF", type=["docx", "pdf"])
-with col2:
     style = st.selectbox(
         "Citation style",
         ["APA/Harvard (author–year)", "IEEE (numeric [1])", "Vancouver (numeric (1)/superscript)"],
         index=0,
     )
+    st.caption("Tip: For best reference parsing, upload DOCX with a clear 'References' heading.")
 
 if uploaded is None:
     st.info("Upload a DOCX or PDF to begin.")
@@ -992,19 +1026,23 @@ st.caption(f"Main text length: {len(main_text):,} chars | Reference entries dete
 with st.expander("Preview detected References (first 50)"):
     st.write("\n\n".join(ref_lines[:50]) if ref_lines else "No references detected.")
 
-# Parse cites + refs based on style
-if style.startswith("APA/Harvard"):
-    cites = extract_author_year_citations(main_text)
-    refs = [parse_reference_author_year(r) for r in ref_lines]
-    refs = [r for r in refs if r is not None]
-elif style.startswith("IEEE"):
-    cites = extract_ieee_numeric_citations(main_text)
-    refs = [parse_reference_numeric(r) for r in ref_lines]
-    refs = [r for r in refs if r is not None]
-else:
-    cites = extract_vancouver_numeric_citations(main_text)
-    refs = [parse_reference_numeric(r) for r in ref_lines]
-    refs = [r for r in refs if r is not None]
+# Parse cites + refs based on style (guarded)
+try:
+    if style.startswith("APA/Harvard"):
+        cites = extract_author_year_citations(main_text)
+        refs = [parse_reference_author_year(r) for r in ref_lines]
+        refs = [r for r in refs if r is not None]
+    elif style.startswith("IEEE"):
+        cites = extract_ieee_numeric_citations(main_text)
+        refs = [parse_reference_numeric(r) for r in ref_lines]
+        refs = [r for r in refs if r is not None]
+    else:
+        cites = extract_vancouver_numeric_citations(main_text)
+        refs = [parse_reference_numeric(r) for r in ref_lines]
+        refs = [r for r in refs if r is not None]
+except Exception as e:
+    st.error(f"Parsing failed: {e}")
+    cites, refs = [], []
 
 df_missing, df_uncited, summary = build_missing_uncited(cites, refs)
 
@@ -1022,7 +1060,7 @@ with c1:
     if df_missing.empty:
         st.success("None detected.")
     else:
-        st.dataframe(df_missing, width="stretch", height=420)
+        st_df(df_missing, height=420)
         st.download_button(
             "Download missing (CSV)",
             df_missing.to_csv(index=False).encode("utf-8"),
@@ -1035,7 +1073,7 @@ with c2:
     if df_uncited.empty:
         st.success("None detected.")
     else:
-        st.dataframe(df_uncited, width="stretch", height=420)
+        st_df(df_uncited, height=420)
         st.download_button(
             "Download uncited (CSV)",
             df_uncited.to_csv(index=False).encode("utf-8"),
@@ -1046,15 +1084,20 @@ with c2:
 st.divider()
 st.subheader("Reconciliation (maps in-text citations to exact references)")
 
-if style.startswith("APA/Harvard"):
-    df_c2r, df_r2c = reconcile_author_year(cites, refs)
-else:
-    df_c2r, df_r2c = reconcile_numeric(cites, refs)
+try:
+    if style.startswith("APA/Harvard"):
+        df_c2r, df_r2c = reconcile_author_year(cites, refs)
+    else:
+        df_c2r, df_r2c = reconcile_numeric(cites, refs)
+except Exception as e:
+    st.error(f"Reconciliation failed: {e}")
+    df_c2r = pd.DataFrame(columns=["in_text", "status", "matched_reference"])
+    df_r2c = pd.DataFrame(columns=["reference", "times_cited", "cited_by"])
 
 left, right = st.columns(2)
 with left:
     st.markdown("### In-text → Reference")
-    st.dataframe(df_c2r, width="stretch", height=420)
+    st_df(df_c2r, height=420)
     st.download_button(
         "Download in-text to reference mapping (CSV)",
         df_c2r.to_csv(index=False).encode("utf-8"),
@@ -1064,7 +1107,7 @@ with left:
 
 with right:
     st.markdown("### Reference → Cited by")
-    st.dataframe(df_r2c, width="stretch", height=420)
+    st_df(df_r2c, height=420)
     st.download_button(
         "Download reference to in-text mapping (CSV)",
         df_r2c.to_csv(index=False).encode("utf-8"),
@@ -1086,76 +1129,94 @@ max_to_check = st.number_input(
     "Max references to verify (for speed)",
     min_value=10,
     max_value=5000,
-    value=min(200, max(10, len(refs))),
+    value=min(200, max(10, len(refs))) if refs else 10,
     step=10,
-    disabled=not enable_verify
+    disabled=not enable_verify,
 )
 
 df_verify = pd.DataFrame()
 
+def _ping(url: str, params: dict) -> Tuple[bool, str]:
+    try:
+        _ = _get_json(url, params)
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:240]
+
 if enable_verify:
-    test_ok = True
-    test_msg = ""
+    ok_cr, err_cr = (True, "")
+    ok_oa, err_oa = (True, "")
+
     if use_crossref:
-        try:
-            _ = _get_json(CROSSREF_API, {"rows": 1})
-        except Exception as e:
-            test_ok = False
-            test_msg = str(e)[:220]
+        ok_cr, err_cr = _ping(CROSSREF_API, {"rows": 1})
+    if use_openalex:
+        ok_oa, err_oa = _ping(OPENALEX_API, {"per-page": 1})
 
-    if (use_crossref and not test_ok) and (not use_openalex):
-        st.error("Online verification can’t reach Crossref from this deployment.")
-        st.write(f"Error: {test_msg}")
-    else:
-        rows = []
-        progress = st.progress(0)
-        work = refs[: int(max_to_check)]
-        total = len(work) if work else 1
+    if (use_crossref and not ok_cr) and (use_openalex and not ok_oa):
+        st.error("Online verification can’t reach Crossref and OpenAlex from this deployment.")
+        st.write(f"Crossref error: {err_cr}")
+        st.write(f"OpenAlex error: {err_oa}")
+    elif (use_crossref and not ok_cr) and use_openalex:
+        st.warning("Crossref is unreachable right now. Continuing with OpenAlex.")
+        st.write(f"Crossref error: {err_cr}")
+    elif (use_openalex and not ok_oa) and use_crossref:
+        st.warning("OpenAlex is unreachable right now. Continuing with Crossref.")
+        st.write(f"OpenAlex error: {err_oa}")
 
-        for i, r in enumerate(work):
-            res = verify_reference_online(
-                r,
-                throttle_s=float(throttle),
-                use_crossref=bool(use_crossref),
-                use_openalex=bool(use_openalex),
-            )
-            rows.append(
-                {
-                    "reference": (r.raw[:240] + "…") if len(r.raw) > 240 else r.raw,
-                    "status": res.get("status", ""),
-                    "source": res.get("source", ""),
-                    "score": res.get("score", ""),
-                    "doi": res.get("doi", ""),
-                    "matched_year": res.get("matched_year", ""),
-                    "matched_first_author": res.get("matched_first_author", ""),
-                    "matched_title": res.get("matched_title", ""),
-                    "query_used": res.get("query_used", ""),
-                    "error_crossref": res.get("error_crossref", ""),
-                    "error_openalex": res.get("error_openalex", ""),
-                }
-            )
-            progress.progress(int((i + 1) / total * 100))
+    rows = []
+    progress = st.progress(0)
+    work = refs[: int(max_to_check)] if refs else []
+    total = len(work) if work else 1
 
-        df_verify = pd.DataFrame(rows)
-        st.dataframe(df_verify, width="stretch", height=460)
-        st.download_button(
-            "Download verification (CSV)",
-            df_verify.to_csv(index=False).encode("utf-8"),
-            file_name="online_verification.csv",
-            mime="text/csv",
+    for i, r in enumerate(work):
+        res = verify_reference_online(
+            r,
+            throttle_s=float(throttle),
+            use_crossref=bool(use_crossref and ok_cr),
+            use_openalex=bool(use_openalex and ok_oa),
         )
+        rows.append(
+            {
+                "reference": (r.raw[:240] + "…") if len(r.raw) > 240 else r.raw,
+                "status": res.get("status", ""),
+                "source": res.get("source", ""),
+                "score": res.get("score", ""),
+                "doi": res.get("doi", ""),
+                "matched_year": res.get("matched_year", ""),
+                "matched_first_author": res.get("matched_first_author", ""),
+                "matched_title": res.get("matched_title", ""),
+                "query_used": res.get("query_used", ""),
+                "error_crossref": res.get("error_crossref", ""),
+                "error_openalex": res.get("error_openalex", ""),
+            }
+        )
+        progress.progress(int((i + 1) / total * 100))
 
-        flagged = df_verify[df_verify["status"].isin(["not_found", "needs_review"])] if not df_verify.empty else pd.DataFrame()
-        if len(flagged) > 0:
-            st.warning(f"Flagged {len(flagged)} items as Not found or Needs review. Check these first.")
-            with st.expander("Show flagged only"):
-                st.dataframe(flagged, width="stretch", height=360)
+    df_verify = pd.DataFrame(rows)
+    df_verify = ensure_columns(
+        df_verify,
+        ["reference", "status", "source", "score", "doi", "matched_year", "matched_first_author", "matched_title", "query_used", "error_crossref", "error_openalex"]
+    )
+
+    st_df(df_verify, height=460)
+    st.download_button(
+        "Download verification (CSV)",
+        df_verify.to_csv(index=False).encode("utf-8"),
+        file_name="online_verification.csv",
+        mime="text/csv",
+    )
+
+    flagged = df_verify[df_verify["status"].isin(["not_found", "needs_review", "offline"])]
+    if len(flagged) > 0:
+        st.warning(f"Flagged {len(flagged)} items as Not found, Needs review, or Offline. Check these first.")
+        with st.expander("Show flagged only"):
+            st_df(flagged, height=360)
 
 with st.expander("Diagnostics"):
     st.markdown("#### Sample extracted in-text citations (first 120)")
-    st.dataframe(pd.DataFrame([c.__dict__ for c in cites[:120]]), width="stretch")
+    st_df(pd.DataFrame([c.__dict__ for c in cites[:120]]), height=360)
     st.markdown("#### Sample parsed references (first 120)")
-    st.dataframe(pd.DataFrame([r.__dict__ for r in refs[:120]]), width="stretch")
+    st_df(pd.DataFrame([r.__dict__ for r in refs[:120]]), height=360)
     if enable_verify and not df_verify.empty:
         st.markdown("#### Sample verification output (first 60)")
-        st.dataframe(df_verify.head(60), width="stretch")
+        st_df(df_verify.head(60), height=360)
