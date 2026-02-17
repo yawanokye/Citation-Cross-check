@@ -21,6 +21,10 @@ import requests
 from rapidfuzz import fuzz
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+
+import streamlit as st
+st.write("✅ App started, reached top of app.py")
+
 # ----------------------------
 # Optional dependencies
 # ----------------------------
@@ -1234,4 +1238,5 @@ with st.expander("Diagnostics"):
     if enable_verify and not df_verify.empty:
         st.markdown("#### Sample verification output (first 60)")
         st_df(df_verify.head(60), height=360)
+
 
