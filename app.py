@@ -1,13 +1,15 @@
 # app.py
 # Citation Crosschecker (APA/Harvard + IEEE + Vancouver) + Online verification (Crossref + OpenAlex)
-# Key fixes:
-# 1) Narrative multi-author citations no longer generate extra single-author hits inside them
-#    (so "Krejcie and Morgan (1970)" will NOT also create "Morgan (1970)").
-# 2) Bare years like "(1991)" are ignored as citations.
-# 3) Missing/Uncited tables show FULL raw in-text citations and full reference entries.
-# 4) IEEE numeric supported: [1], [1-3], [1,2,5]
-# 5) Reconciliation tables: in-text -> reference and reference -> cited-by (APA and numeric)
-# 6) Online verification: DOI lookup + bibliographic search against Crossref and OpenAlex
+# Fixes in this version:
+# 1) Keeps ALL occurrences of in-text citations (no forced de-dup), so counts are correct.
+# 2) Stronger reference-entry merging for DOCX and PDF (handles wrapped lines better).
+# 3) Narrative multi-author citations are overlap-blocked so "Krejcie and Morgan (1970)"
+#    will NOT also generate "Morgan (1970)".
+# 4) Bare years like "(1991)" are ignored as citations.
+# 5) Missing/Uncited tables show FULL raw in-text citations and full reference entries.
+# 6) IEEE numeric supported: [1], [1–3], [1,2,5]
+# 7) Reconciliation tables: in-text -> reference and reference -> cited-by (APA and numeric)
+# 8) Online verification: DOI lookup + bibliographic search against Crossref and OpenAlex
 
 import re
 import io
@@ -22,6 +24,7 @@ import pandas as pd
 import requests
 from rapidfuzz import fuzz
 from tenacity import retry, stop_after_attempt, wait_exponential
+
 
 # ----------------------------
 # Optional dependencies
@@ -55,11 +58,10 @@ REF_HEADINGS = [
 ]
 
 NONCITE_LEADS = {
-    "e.g", "i.e", "see", "cf", "for example", "for instance",
+    "eg", "ie", "see", "cf", "for example", "for instance",
     "chapter", "section", "table", "figure", "eq", "equation", "appendix",
 }
 
-# narrative false-positive guard
 BAD_NARRATIVE_PREFIX_WORDS = {
     "traditional", "classical", "analytical", "for", "from", "in", "on", "at", "by",
     "methods", "method", "approach", "approaches", "sample", "size", "power",
@@ -107,7 +109,7 @@ class ReferenceEntry:
 # Normalisation helpers
 # ============================
 def norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+    return re.sub(r"\s+", " ", (s or "").replace("\u00a0", " ").strip())
 
 def _strip_accents(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
@@ -120,6 +122,12 @@ def norm_token(s: str) -> str:
     s = re.sub(r"[^a-z0-9\-\s'&\.]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def norm_lead_token(s: str) -> str:
+    # for NONCITE_LEADS matching
+    s = norm_token(s)
+    s = s.replace(".", "")
+    return s.strip()
 
 def canon_org(name: str) -> str:
     n = norm_token(name)
@@ -168,7 +176,7 @@ def is_bare_year_parenthetical(raw_inside: str) -> bool:
     return bool(re.fullmatch(rf"{YEAR}", s))
 
 def split_semicolons(block: str) -> List[str]:
-    parts = [p.strip() for p in (block or "").split(";") if p.strip()]
+    parts = [p.strip() for p in re.split(r"\s*;\s*", (block or "")) if p.strip()]
     return parts if parts else [block.strip()]
 
 
@@ -191,6 +199,48 @@ def read_pdf_text(file_bytes: bytes) -> str:
             out.append(p.extract_text() or "")
     return "\n".join(out)
 
+
+# ============================
+# Reference entry merging
+# ============================
+def _starts_new_reference(line: str) -> bool:
+    ln = norm_space(line)
+    if not ln:
+        return False
+    # numeric references
+    if re.match(r"^\[\s*\d{1,5}\s*\]", ln):
+        return True
+    if re.match(r"^\d{1,5}\s*[\.\)]\s+", ln):
+        return True
+    # author-year ref list often starts with "Surname," or "Organization."
+    if re.match(r"^[A-Z][A-Za-z\-']{2,40}\s*,\s*[A-Z]", ln):
+        return True
+    # org with year early: "World Health Organization. (2020)..."
+    if re.match(r"^[A-Z].{2,80}\(\s*" + YEAR + r"\s*\)", ln):
+        return True
+    return False
+
+def merge_reference_lines(raw_lines: List[str]) -> List[str]:
+    lines = [norm_space(x) for x in (raw_lines or []) if norm_space(x)]
+    if not lines:
+        return []
+    merged: List[str] = []
+    buf = ""
+    for ln in lines:
+        if not buf:
+            buf = ln
+            continue
+        if _starts_new_reference(ln):
+            merged.append(buf.strip())
+            buf = ln
+        else:
+            buf = (buf + " " + ln).strip()
+    if buf:
+        merged.append(buf.strip())
+    # prune very short noise lines
+    merged = [m for m in merged if len(m) >= 10]
+    return merged
+
 def split_main_and_references_from_docx(paras: List[str]) -> Tuple[str, List[str], str]:
     heading_idx = None
     heading_line = ""
@@ -210,23 +260,8 @@ def split_main_and_references_from_docx(paras: List[str]) -> Tuple[str, List[str
     main = "\n".join(paras[:heading_idx]).strip()
     refs_paras = paras[heading_idx + 1 :]
 
-    refs: List[str] = []
-    buf = ""
-    for p in refs_paras:
-        if not buf:
-            buf = p
-            continue
-        # merge wrapped lines a bit
-        if re.match(r"^\s*([a-z]|\d|\()", p):
-            buf = (buf + " " + p).strip()
-        else:
-            refs.append(buf.strip())
-            buf = p
-    if buf:
-        refs.append(buf.strip())
-
-    refs = [r for r in refs if len(r) >= 10]
-    return main, refs, f"Found heading: {heading_line}"
+    ref_lines = merge_reference_lines(refs_paras)
+    return main, ref_lines, f"Found heading: {heading_line}"
 
 
 # ============================
@@ -237,23 +272,30 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
     if not r:
         return None
 
-    m = re.search(rf"\(\s*({YEAR})\s*\)", r)
+    # remove numeric label if present
+    r2 = re.sub(r"^\[\s*\d{1,5}\s*\]\s*", "", r)
+    r2 = re.sub(r"^\d{1,5}\s*[\.\)]\s+", "", r2).strip()
+
+    m = re.search(rf"\(\s*({YEAR})\s*\)", r2)
     if not m:
-        m2 = re.search(rf"\b({YEAR})\b", r)
+        m2 = re.search(rf"\b({YEAR})\b", r2)
         if not m2:
             return None
         year = m2.group(1)
-        pre = r[: m2.start()].strip()
+        pre = r2[: m2.start()].strip()
     else:
         year = m.group(1)
-        pre = r[: m.start()].strip()
+        pre = r2[: m.start()].strip()
+
+    if not pre:
+        return None
 
     # org reference
     if is_known_org(pre) or pre.upper() in ORG_ACRONYMS:
         k = f"org_{canon_org(pre)}_{year.lower()}"
         return ReferenceEntry(raw=r, key=k, year=year, surnames=(pre,), number=None)
 
-    # first author surname (reference list usually starts with "Surname, ...")
+    # first author surname (best-effort)
     if "," in pre:
         first = pre.split(",")[0].strip()
     else:
@@ -295,8 +337,6 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
     out: List[InTextCitation] = []
     txt = text or ""
 
-    # Track spans already captured so we don't re-capture pieces like "Morgan (1970)"
-    # inside "Krejcie and Morgan (1970)".
     taken_spans: List[Tuple[int, int]] = []
 
     def _overlaps(span: Tuple[int, int], spans: List[Tuple[int, int]]) -> bool:
@@ -309,7 +349,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
     # --- Parenthetical blocks that contain a year ---
     paren_blocks = re.finditer(rf"\(([^()]*\b{YEAR}\b[^()]*)\)", txt)
     for m in paren_blocks:
-        inside = m.group(1).strip()
+        inside = (m.group(1) or "").strip()
 
         # Reject bare years like "(1991)"
         if is_bare_year_parenthetical(inside):
@@ -323,8 +363,8 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             y = y_m.group(1)
 
             left = c[: y_m.start()].strip().rstrip(",").strip()
-            left_norm = norm_token(left)
-            if left_norm in NONCITE_LEADS:
+            left_lead = norm_lead_token(left)
+            if left_lead in NONCITE_LEADS:
                 continue
 
             # ORG citations
@@ -352,15 +392,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             k = key_author_year(first, y)
             out.append(InTextCitation("author-year", f"({norm_space(c)})", k, year=y, surnames=tuple(cand)))
 
-    # ============================
-    # Narrative citations (FIXED + overlap-blocking)
-    # ============================
-
-    # 1) Multi-author narrative:
-    #    Krejcie and Morgan (1970)
-    #    Bartlett, Kotrlik and Higgins (2001)
-    #    Bartlett, Kotrlik, and Higgins (2001)
-    #    Bartlett, Kotrlik, & Higgins (2001)
+    # --- Narrative multi-author ---
     narr_multi = re.finditer(
         rf"""
         \b
@@ -381,7 +413,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         if _overlaps(span, taken_spans):
             continue
 
-        authors_blob = m.group("authors").strip()
+        authors_blob = (m.group("authors") or "").strip()
         y = m.group("year")
 
         first_word = norm_token(authors_blob.split()[0]) if authors_blob.split() else ""
@@ -396,12 +428,10 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
 
         first = cand[0]
         k = key_author_year(first, y)
-
-        # Keep FULL raw: "Krejcie and Morgan (1970)"
         out.append(InTextCitation("author-year", m.group(0), k, year=y, surnames=tuple(cand)))
         taken_spans.append(span)
 
-    # 2) "et al." narrative: A et al. (YEAR)
+    # --- Narrative et al. ---
     narr_etal = re.finditer(
         rf"\b(?P<a>[A-Z][A-Za-z\-']{{1,40}})\s+et\s+al\.\s*\(\s*(?P<y>{YEAR})\s*\)",
         txt,
@@ -412,14 +442,13 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         if _overlaps(span, taken_spans):
             continue
 
-        first = m.group("a").strip()
+        first = (m.group("a") or "").strip()
         y = m.group("y")
         if looks_like_surname(first):
             out.append(InTextCitation("author-year", m.group(0), key_author_year(first, y), year=y, surnames=(first,)))
             taken_spans.append(span)
 
-    # 3) Single-author narrative: A (YEAR) or ORG (YEAR)
-    #    IMPORTANT: skip any match that sits inside an already-captured multi-author narrative.
+    # --- Narrative single-author ---
     narr_single = re.finditer(
         rf"\b(?P<author>[A-Z][A-Za-z\-']{{1,40}})\s*\(\s*(?P<year>{YEAR})\s*\)",
         txt,
@@ -429,7 +458,7 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
         if _overlaps(span, taken_spans):
             continue
 
-        au = m.group("author").strip()
+        au = (m.group("author") or "").strip()
         y = m.group("year")
 
         if norm_token(au) in BAD_NARRATIVE_PREFIX_WORDS:
@@ -442,14 +471,8 @@ def extract_author_year_citations(text: str) -> List[InTextCitation]:
             if looks_like_surname(au):
                 out.append(InTextCitation("author-year", m.group(0), key_author_year(au, y), year=y, surnames=(au,)))
 
-    # De-dup by raw
-    uniq: List[InTextCitation] = []
-    seen = set()
-    for c in out:
-        if c.raw not in seen:
-            uniq.append(c)
-            seen.add(c.raw)
-    return uniq
+    # IMPORTANT: do NOT de-dup here, counts must reflect true frequency.
+    return out
 
 
 # ============================
@@ -468,7 +491,7 @@ def _sup_to_int(s: str) -> Optional[int]:
         return None
 
 def _expand_numeric_chunks(inside: str) -> List[int]:
-    inside = inside.replace("–", "-")
+    inside = (inside or "").replace("–", "-")
     chunks = [c.strip() for c in inside.split(",") if c.strip()]
     nums: List[int] = []
     for c in chunks:
@@ -498,6 +521,7 @@ def extract_vancouver_numeric_citations(text: str) -> List[InTextCitation]:
     paren = re.compile(r"\(\s*(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\s*\)")
     for m in paren.finditer(text or ""):
         inside = m.group(1)
+        # avoid years like (1970)
         if re.fullmatch(rf"{YEAR}", inside.strip()):
             continue
         for n in _expand_numeric_chunks(inside):
@@ -537,7 +561,7 @@ def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry
                     "matched_reference": " || ".join(h.raw[:200] for h in hits),
                 }
             )
-    df_c2r = pd.DataFrame(rows)
+    df_c2r = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["in_text", "status", "matched_reference"])
 
     cite_group = defaultdict(list)
     for c in cites:
@@ -549,11 +573,14 @@ def reconcile_author_year(cites: List[InTextCitation], refs: List[ReferenceEntry
         ref_rows.append(
             {
                 "reference": r.raw,
-                "times_cited": len(cited_by),
+                "times_cited": int(len(cited_by)),
                 "cited_by": "; ".join(cited_by[:12]) + (" ..." if len(cited_by) > 12 else ""),
             }
         )
-    df_r2c = pd.DataFrame(ref_rows).sort_values(["times_cited"], ascending=False)
+    df_r2c = pd.DataFrame(ref_rows) if ref_rows else pd.DataFrame(columns=["reference", "times_cited", "cited_by"])
+    if len(df_r2c):
+        df_r2c = df_r2c.sort_values(["times_cited", "reference"], ascending=[False, True]).reset_index(drop=True)
+
     return df_c2r, df_r2c
 
 def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -566,7 +593,7 @@ def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -
             rows.append({"in_text": c.raw, "status": "not_found", "matched_reference": ""})
         else:
             rows.append({"in_text": c.raw, "status": "matched", "matched_reference": r.raw})
-    df_c2r = pd.DataFrame(rows)
+    df_c2r = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["in_text", "status", "matched_reference"])
 
     cite_group = defaultdict(list)
     for c in cites:
@@ -578,49 +605,51 @@ def reconcile_numeric(cites: List[InTextCitation], refs: List[ReferenceEntry]) -
         ref_rows.append(
             {
                 "reference": r.raw,
-                "times_cited": len(cited_by),
+                "times_cited": int(len(cited_by)),
                 "cited_by": "; ".join(cited_by[:18]) + (" ..." if len(cited_by) > 18 else ""),
             }
         )
-    df_r2c = pd.DataFrame(ref_rows).sort_values(["times_cited"], ascending=False)
+    df_r2c = pd.DataFrame(ref_rows) if ref_rows else pd.DataFrame(columns=["reference", "times_cited", "cited_by"])
+    if len(df_r2c):
+        df_r2c = df_r2c.sort_values(["times_cited", "reference"], ascending=[False, True]).reset_index(drop=True)
+
     return df_c2r, df_r2c
 
 
 # ============================
-# Missing + Uncited (full raw)
+# Missing + Uncited (full raw, correct counts)
 # ============================
 def build_missing_uncited(cites: List[InTextCitation], refs: List[ReferenceEntry]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
-    cite_keys = [c.key for c in cites]
-    ref_keys = [r.key for r in refs]
-
     cite_count_by_raw = Counter([c.raw for c in cites])
     cite_key_by_raw: Dict[str, str] = {}
     for c in cites:
+        # first observed key for this raw
         cite_key_by_raw.setdefault(c.raw, c.key)
 
+    ref_key_set = set([r.key for r in refs])
+
     missing_rows = []
-    ref_key_set = set(ref_keys)
     for raw, cnt in cite_count_by_raw.items():
         k = cite_key_by_raw.get(raw, "")
         if k and (k not in ref_key_set):
-            missing_rows.append({"citation_in_text": raw, "count_in_text": cnt})
+            missing_rows.append({"citation_in_text": raw, "count_in_text": int(cnt)})
 
-    if missing_rows:
-        df_missing = pd.DataFrame(missing_rows).sort_values(
-            ["count_in_text", "citation_in_text"], ascending=[False, True]
-        )
-    else:
-        df_missing = pd.DataFrame(columns=["citation_in_text", "count_in_text"])
+    df_missing = (
+        pd.DataFrame(missing_rows).sort_values(["count_in_text", "citation_in_text"], ascending=[False, True]).reset_index(drop=True)
+        if missing_rows
+        else pd.DataFrame(columns=["citation_in_text", "count_in_text"])
+    )
 
-    cite_key_set = set(cite_keys)
+    cite_key_set = set([c.key for c in cites])
     uncited_rows = [{"reference_full": r.raw} for r in refs if r.key not in cite_key_set]
     df_uncited = pd.DataFrame(uncited_rows) if uncited_rows else pd.DataFrame(columns=["reference_full"])
 
     summary = {
-        "in_text_citations_found": len(cites),
-        "reference_entries_found": len(refs),
-        "missing_in_references": len(df_missing),
-        "uncited_references": len(df_uncited),
+        "in_text_citations_found": int(len(cites)),
+        "unique_in_text_citations": int(len(cite_count_by_raw)),
+        "reference_entries_found": int(len(refs)),
+        "missing_in_references": int(len(df_missing)),
+        "uncited_references": int(len(df_uncited)),
     }
     return df_missing, df_uncited, summary
 
@@ -740,13 +769,10 @@ def year_match_ok(ref_year: Optional[int], cand_year: Optional[int]) -> bool:
 
 def guess_title_snippet(ref: str) -> str:
     r = norm_space(ref)
-    # remove DOI noise
     r = re.sub(r"https?://doi\.org/\S+", " ", r, flags=re.I)
     r = re.sub(r"\b10\.\d{4,9}/\S+", " ", r, flags=re.I)
-    # remove year parens content to focus on title
     r = re.sub(rf"\(.*?\b{YEAR}\b.*?\)", " ", r)
     r = norm_space(r)
-    # drop leading author segment up to first period if present
     r = re.sub(r"^[^\.]{1,220}\.\s*", " ", r)
     r = norm_space(r)
     words = r.split()
@@ -762,18 +788,14 @@ def verify_reference_online(
     doi = extract_doi(ref_entry)
 
     ref_year = _as_int_year(ref_obj.year)
-    # for author-year keys we have first surname
     ref_surname = ""
     if ref_obj.key.startswith("au_") and ref_obj.surnames:
         ref_surname = ref_obj.surnames[0] or ""
     who_is_org = ref_obj.key.startswith("org_")
 
     title_snip = guess_title_snippet(ref_entry)
-
-    # Throttle calls a little
     time.sleep(max(0.0, float(throttle_s or 0.0)))
 
-    # Prefer DOI lookup if DOI exists
     if doi and use_crossref:
         cr = crossref_lookup_by_doi(doi)
         if cr:
@@ -805,7 +827,6 @@ def verify_reference_online(
             "error_openalex": "",
         }
 
-    # Build a query
     parts = []
     if ref_surname:
         parts.append(ref_surname)
@@ -828,7 +849,6 @@ def verify_reference_online(
         "error_openalex": "",
     }
 
-    # Crossref search
     if use_crossref:
         try:
             items = crossref_search(query, rows=10)
@@ -838,7 +858,6 @@ def verify_reference_online(
                 cand_title = crossref_title(it)
                 cand_doi = (it.get("DOI") or "").strip()
 
-                # filters if we have surname/year
                 if not who_is_org:
                     if ref_surname and cand_fam and not author_match_ok(ref_surname, cand_fam):
                         continue
@@ -867,7 +886,6 @@ def verify_reference_online(
         except Exception as e:
             best["error_crossref"] = str(e)[:220]
 
-    # OpenAlex search
     if use_openalex:
         try:
             items = openalex_search(query, per_page=10)
@@ -953,10 +971,10 @@ try:
         main_text, ref_lines, ref_msg = split_main_and_references_from_docx(paras)
     else:
         full = read_pdf_text(file_bytes)
-        lines = full.splitlines()
+        lines = [ln for ln in full.splitlines() if ln is not None]
         idx = None
         for i, ln in enumerate(lines):
-            s = ln.strip()
+            s = (ln or "").strip()
             if any(re.search(p, s, flags=re.I) for p in REF_HEADINGS):
                 idx = i
                 ref_msg = f"Found heading: {s}"
@@ -969,21 +987,7 @@ try:
             main_text = "\n".join(lines[:idx]).strip()
             ref_block = "\n".join(lines[idx + 1 :]).strip()
             raw_lines = [ln.strip() for ln in ref_block.splitlines() if ln.strip()]
-
-            merged = []
-            buf = ""
-            for ln in raw_lines:
-                if not buf:
-                    buf = ln
-                    continue
-                if re.match(r"^\s*(\[\d+\]|\d+[\.\)]|\d+\s)", ln):
-                    merged.append(buf)
-                    buf = ln
-                else:
-                    buf = (buf + " " + ln).strip()
-            if buf:
-                merged.append(buf)
-            ref_lines = merged
+            ref_lines = merge_reference_lines(raw_lines)
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
@@ -996,21 +1000,8 @@ if not ref_lines:
     with st.expander("Paste References manually"):
         pasted_refs = st.text_area("Paste your References section here", height=220)
         if pasted_refs.strip():
-            lines = [x.strip() for x in pasted_refs.splitlines() if x.strip()]
-            merged = []
-            buf = ""
-            for ln in lines:
-                if not buf:
-                    buf = ln
-                    continue
-                if re.match(r"^\s*(\[\d+\]|\d+[\.\)]|\d+\s)", ln):
-                    merged.append(buf)
-                    buf = ln
-                else:
-                    buf = (buf + " " + ln).strip()
-            if buf:
-                merged.append(buf)
-            ref_lines = merged
+            raw_lines = [x.strip() for x in pasted_refs.splitlines() if x.strip()]
+            ref_lines = merge_reference_lines(raw_lines)
 
 st.caption(f"Main text length: {len(main_text):,} chars | Reference entries detected: {len(ref_lines):,}")
 
@@ -1033,11 +1024,12 @@ else:
 
 df_missing, df_uncited, summary = build_missing_uncited(cites, refs)
 
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("In-text citations", summary["in_text_citations_found"])
-m2.metric("Reference entries", summary["reference_entries_found"])
-m3.metric("Missing", summary["missing_in_references"])
-m4.metric("Uncited", summary["uncited_references"])
+m2.metric("Unique in-text", summary["unique_in_text_citations"])
+m3.metric("Reference entries", summary["reference_entries_found"])
+m4.metric("Missing", summary["missing_in_references"])
+m5.metric("Uncited", summary["uncited_references"])
 
 st.divider()
 c1, c2 = st.columns(2)
@@ -1107,12 +1099,18 @@ enable_verify = st.checkbox("Enable online verification", value=False)
 use_crossref = st.checkbox("Use Crossref", value=True, disabled=not enable_verify)
 use_openalex = st.checkbox("Use OpenAlex", value=True, disabled=not enable_verify)
 throttle = st.slider("Throttle seconds between queries", 0.0, 2.0, 0.25, 0.05, disabled=not enable_verify)
-max_to_check = st.number_input("Max references to verify (for speed)", min_value=10, max_value=5000, value=min(200, max(10, len(refs))), step=10, disabled=not enable_verify)
+max_to_check = st.number_input(
+    "Max references to verify (for speed)",
+    min_value=10,
+    max_value=5000,
+    value=min(200, max(10, len(refs))),
+    step=10,
+    disabled=not enable_verify
+)
 
 df_verify = pd.DataFrame()
 
 if enable_verify:
-    # quick connectivity test to give clean error messages
     test_ok = True
     test_msg = ""
     if use_crossref:
