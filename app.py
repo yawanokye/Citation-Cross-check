@@ -1121,7 +1121,7 @@ with c1:
     if df_missing.empty:
         st.success("None detected.")
     else:
-        st.dataframe(df_missing, use_container_width=True, height=420)
+        st.dataframe(df_missing, width="stretch", height=420)
         st.download_button(
             "Download missing (CSV)",
             df_missing.to_csv(index=False).encode("utf-8"),
@@ -1134,7 +1134,7 @@ with c2:
     if df_uncited.empty:
         st.success("None detected.")
     else:
-        st.dataframe(df_uncited, use_container_width=True, height=420)
+        st.dataframe(df_uncited, width="stretch", height=420)
         st.download_button(
             "Download uncited (CSV)",
             df_uncited.to_csv(index=False).encode("utf-8"),
@@ -1153,7 +1153,7 @@ else:
 left, right = st.columns(2)
 with left:
     st.markdown("### In-text → Reference")
-    st.dataframe(df_c2r, use_container_width=True, height=420)
+    st.dataframe(df_c2r, width="stretch", height=420)
     st.download_button(
         "Download in-text to reference mapping (CSV)",
         df_c2r.to_csv(index=False).encode("utf-8"),
@@ -1163,7 +1163,7 @@ with left:
 
 with right:
     st.markdown("### Reference → Cited by")
-    st.dataframe(df_r2c, use_container_width=True, height=420)
+    st.dataframe(df_r2c, width="stretch", height=420)
     st.download_button(
         "Download reference to in-text mapping (CSV)",
         df_r2c.to_csv(index=False).encode("utf-8"),
@@ -1236,7 +1236,7 @@ if enable_verify:
             progress.progress(int((i + 1) / total * 100))
 
         df_verify = pd.DataFrame(rows)
-        st.dataframe(df_verify, use_container_width=True, height=460)
+        st.dataframe(df_verify, width="stretch", height=460)
         st.download_button(
             "Download verification (CSV)",
             df_verify.to_csv(index=False).encode("utf-8"),
@@ -1248,14 +1248,15 @@ if enable_verify:
         if len(flagged) > 0:
             st.warning(f"Flagged {len(flagged)} items as Not found or Needs review. Check these first.")
             with st.expander("Show flagged only"):
-                st.dataframe(flagged, use_container_width=True, height=360)
+                st.dataframe(flagged, width="stretch", height=360)
 
 with st.expander("Diagnostics"):
     st.markdown("#### Sample extracted in-text citations (first 120)")
-    st.dataframe(pd.DataFrame([c.__dict__ for c in cites[:120]]), use_container_width=True)
+    st.dataframe(pd.DataFrame([c.__dict__ for c in cites[:120]]), width="stretch")
     st.markdown("#### Sample parsed references (first 120)")
-    st.dataframe(pd.DataFrame([r.__dict__ for r in refs[:120]]), use_container_width=True)
+    st.dataframe(pd.DataFrame([r.__dict__ for r in refs[:120]]), width="stretch")
     if enable_verify and not df_verify.empty:
         st.markdown("#### Sample verification output (first 60)")
-        st.dataframe(df_verify.head(60), use_container_width=True)
+        st.dataframe(df_verify.head(60), width="stretch")
+
 
