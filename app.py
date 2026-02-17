@@ -40,6 +40,11 @@ try:
 except Exception:
     PDF_OK = False
 
+def require_lib(lib, name: str):
+    if lib is None:
+        st.error(f"{name} is not available in this deployment. Check requirements.txt and rebuild.")
+        st.stop()
+
 
 # ============================
 # Constants
@@ -175,21 +180,22 @@ def split_semicolons(block: str) -> List[str]:
 # ============================
 # File readers
 # ============================
-def read_docx_paragraphs(file_bytes: bytes) -> List[str]:
-    if not DOCX_OK:
-        raise RuntimeError("python-docx not installed")
-    doc = Document(io.BytesIO(file_bytes))
-    paras = [norm_space(p.text) for p in doc.paragraphs]
-    return [p for p in paras if p]
+def read_docx(file) -> str:
+    require_lib(docx, "python-docx")
+    d = docx.Document(file)
+    parts = []
+    for _, txt in iter_block_items(d):
+        parts.append(txt)
+    return "\n".join(parts)
 
-def read_pdf_text(file_bytes: bytes) -> str:
-    if not PDF_OK:
-        raise RuntimeError("pdfplumber not installed")
+def read_pdf(file) -> str:
+    require_lib(pdfplumber, "pdfplumber")
     out = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+    with pdfplumber.open(file) as pdf:
         for p in pdf.pages:
             out.append(p.extract_text() or "")
     return "\n".join(out)
+
 
 def split_main_and_references_from_docx(paras: List[str]) -> Tuple[str, List[str], str]:
     heading_idx = None
@@ -1178,3 +1184,4 @@ with st.expander("Diagnostics"):
     if enable_verify and not df_verify.empty:
         st.markdown("#### Sample verification output (first 60)")
         st.dataframe(df_verify.head(60), use_container_width=True)
+
