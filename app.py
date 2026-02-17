@@ -547,19 +547,30 @@ def parse_reference_author_year(ref_raw: str) -> Optional[ReferenceEntry]:
 
     base = _strip_leading_numbering(r)
 
-    ym = re.search(rf"\b({YEAR})\b", base)
+    ym = re.search(r"\b(19|20)\d{2}\b", base)
     if not ym:
         return None
-    y = ym.group(1).strip()
 
-    pre = base[: ym.start()].strip()
+    year = ym.group(0)
 
-    m_org = re.match(r"^\s*([A-Z][A-Za-z&.\- ]{2,}?)\s*[\.\,]?\s*$", pre)
-    if m_org:
-        org = m_org.group(1).strip()
-        if is_known_org(org) and not looks_like_two_authors(org):
-            k = key_org_year(org, y)
-            return ReferenceEntry(raw=r, key=k, pretty=f"{titleish(org)} {y}", author_or_org=org, year=y)
+    # extract first author surname ONLY
+    m = re.match(r"^\s*([A-Z][A-Za-z\-']+)\s*,", base)
+
+    if not m:
+        return None
+
+    first_author = m.group(1)
+
+    key = f"au_{first_author.lower()}_{year}"
+
+    return ReferenceEntry(
+        raw=r,
+        key=key,
+        pretty=f"{first_author} ({year})",
+        author_or_org=first_author,
+        year=year,
+    )
+
 
     surnames = _extract_surnames_from_author_segment(pre, max_n=2)
     if surnames and looks_like_person_surname(surnames[0]):
@@ -1837,3 +1848,4 @@ with st.expander("Extracted items (debug)"):
     with tab3:
         st.write(f"Split into {len(ref_raw)} raw entries")
         st.text("\n\n---\n\n".join(ref_raw[:20]))
+
